@@ -22,9 +22,9 @@ import io
 
 # ── CONFIGURATION ────────────────────────────────────────────────────────────
 
-TRADE_STATS_FILE = "trade_stats.csv"  # MAE/MFE/SL file from MT5
-TRADES_FILE = "Trades.xlsx"  # Deal log from MT5
-OHLCV_FILE = "MT5_databento-ohlcv-1m.csv"  # 1-min OHLCV
+TRADE_STATS_FILE = "file_examples/trade_stats.csv"  # MAE/MFE/SL file from MT5
+TRADES_FILE = "file_examples/Trades.xlsx"  # Deal log from MT5
+OHLCV_FILE = "file_examples/MT5_databento-ohlcv-1m.csv"  # 1-min OHLCV
 
 OUTPUT_FILE = "training_dataset.csv"
 
@@ -46,14 +46,14 @@ with open(TRADE_STATS_FILE, "r", encoding="utf-16-le") as f:
 stats = pd.read_csv(io.StringIO(content), sep="\t")
 
 # Rename the unnamed SL-distance column
-stats = stats.rename(columns={"Unnamed: 6": "SL_distance"})
+# stats = stats.rename(columns={"Unnamed: 6": "SL"})
 
 # Parse timestamps
 stats["Entry_time"] = pd.to_datetime(stats["Entry_time"], format="%Y.%m.%d %H:%M:%S")
 stats["Exit_time"] = pd.to_datetime(stats["Exit_time"], format="%Y.%m.%d %H:%M:%S")
 
 # Drop rows where SL_distance is zero or missing (avoids divide-by-zero)
-stats = stats[stats["SL_distance"].notna() & (stats["SL_distance"] > 0)].copy()
+stats = stats[stats["SL"].notna() & (stats["SL"] > 0)].copy()
 
 print(f"  {len(stats)} completed trades loaded.")
 
@@ -62,7 +62,7 @@ print(f"  {len(stats)} completed trades loaded.")
 print("Computing RR labels ...")
 
 # MFE is in price points (same units as SL_distance)
-stats["achievable_rr"] = stats["MFE"] / stats["SL_distance"]
+stats["achievable_rr"] = stats["MFE"] / stats["SL"]
 
 # Clip negative MFE to 0 (trade never moved in our favour at all)
 stats["achievable_rr"] = stats["achievable_rr"].clip(lower=0)
@@ -255,7 +255,7 @@ for i, trade in stats.iterrows():
     feats["mae"] = trade["MAE"]
     feats["mfe"] = trade["MFE"]
     feats["pnl"] = trade["PNL"]
-    feats["sl_distance"] = trade["SL_distance"]
+    feats["sl_distance"] = trade["SL"]
     feats["achievable_rr"] = trade["achievable_rr"]
     feats["rr_bucket"] = trade["rr_bucket"]
 
