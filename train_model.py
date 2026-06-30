@@ -13,31 +13,33 @@ Usage:
 """
 
 import pandas as pd
-import numpy as np
+# import numpy as np
 from xgboost import XGBClassifier
 from sklearn.metrics import classification_report, confusion_matrix
-import json
+from sklearn.utils.class_weight import compute_sample_weight
+
+# import json
 
 # ── CONFIGURATION ────────────────────────────────────────────────────────────
 
-INPUT_FILE  = "training_dataset.csv"
-MODEL_FILE  = "rr_model.json"
-FI_FILE     = "feature_importance.csv"
+INPUT_FILE = "training_dataset.csv"
+MODEL_FILE = "rr_model.json"
+FI_FILE = "feature_importance.csv"
 
-TRAIN_RATIO = 0.80   # first 80% of trades (by time) for training
+TRAIN_RATIO = 0.80  # first 80% of trades (by time) for training
 
 # XGBoost params — conservative defaults for small-to-medium datasets
 XGBOOST_PARAMS = dict(
-    n_estimators      = 300,
-    max_depth         = 4,      # shallow = less overfit
-    learning_rate     = 0.05,
-    subsample         = 0.8,
-    colsample_bytree  = 0.8,
-    min_child_weight  = 5,      # require at least 5 samples per leaf
-    gamma             = 0.1,    # minimum loss reduction to split
-    eval_metric       = "mlogloss",
-    early_stopping_rounds = 30,
-    random_state      = 42,
+    n_estimators=300,
+    max_depth=4,  # shallow = less overfit
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    min_child_weight=5,  # require at least 5 samples per leaf
+    gamma=0.1,  # minimum loss reduction to split
+    eval_metric="mlogloss",
+    early_stopping_rounds=30,
+    random_state=42,
 )
 
 # ── LOAD DATA ────────────────────────────────────────────────────────────────
@@ -73,13 +75,13 @@ print(f"Test : {len(X_test)} trades   ({split_date.date()} → {df['entry_time']
 
 print("\nClass distribution in training set:")
 for b in sorted(y_train.unique()):
-    n   = (y_train == b).sum()
+    n = (y_train == b).sum()
     pct = n / len(y_train) * 100
     print(f"  Bucket {b}: {n:4d}  ({pct:.1f}%)")
 
 # Compute scale_pos_weight equivalent via sample_weight
 # This helps XGBoost not just predict the majority class
-from sklearn.utils.class_weight import compute_sample_weight
+
 sample_weights = compute_sample_weight("balanced", y_train)
 
 # ── TRAIN ────────────────────────────────────────────────────────────────────
@@ -89,9 +91,9 @@ print("\nTraining XGBoost ...")
 model = XGBClassifier(**XGBOOST_PARAMS)
 model.fit(
     X_train, y_train,
-    sample_weight   = sample_weights,
-    eval_set        = [(X_test, y_test)],
-    verbose         = False,
+    sample_weight=sample_weights,
+    eval_set=[(X_test, y_test)],
+    verbose=False,
 )
 
 best_iter = model.best_iteration
@@ -103,22 +105,22 @@ y_pred = model.predict(X_test)
 
 print("\n── Test Set Performance ────────────────────────────────────────────────")
 print(classification_report(y_test, y_pred,
-                             target_names=[f"Bucket {i}" for i in range(4)]))
+                            target_names=[f"Bucket {i}" for i in range(4)]))
 
 print("Confusion matrix (rows=actual, cols=predicted):")
 cm = confusion_matrix(y_test, y_pred)
 cm_df = pd.DataFrame(cm,
-    index  =[f"Actual {i}" for i in range(4)],
-    columns=[f"Pred {i}"   for i in range(4)]
-)
+                     index=[f"Actual {i}" for i in range(4)],
+                     columns=[f"Pred {i}" for i in range(4)]
+                     )
 print(cm_df.to_string())
 
 # ── BASELINE COMPARISON ──────────────────────────────────────────────────────
 # A model that always predicts the majority class — our minimum bar to beat
 
 majority_class = y_train.mode()[0]
-baseline_acc   = (y_test == majority_class).mean()
-model_acc      = (y_pred == y_test.values).mean()
+baseline_acc = (y_test == majority_class).mean()
+model_acc = (y_pred == y_test.values).mean()
 
 print(f"\nBaseline accuracy (always predict bucket {majority_class}): {baseline_acc:.3f}")
 print(f"Model accuracy:                                             {model_acc:.3f}")
@@ -141,8 +143,8 @@ y_train_shuffled = y_train.sample(frac=1, random_state=99).values
 model_shuffle = XGBClassifier(**XGBOOST_PARAMS)
 model_shuffle.fit(
     X_train, y_train_shuffled,
-    eval_set  = [(X_test, y_test)],
-    verbose   = False,
+    eval_set=[(X_test, y_test)],
+    verbose=False,
 )
 shuffled_acc = (model_shuffle.predict(X_test) == y_test.values).mean()
 print(f"  Shuffled-label model accuracy: {shuffled_acc:.3f}")
@@ -156,7 +158,7 @@ else:
 
 print("\n── Feature Importance (top 10) ─────────────────────────────────────────")
 fi = pd.DataFrame({
-    "feature":    feature_cols,
+    "feature": feature_cols,
     "importance": model.feature_importances_,
 }).sort_values("importance", ascending=False)
 
