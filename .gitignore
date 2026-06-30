@@ -1,3 +1,8 @@
 /venv/
 /.idea/
 /file_examples/
+/input_files/
+/output_files/
+/plots/
+rr_model.json
+feature_importance.csv

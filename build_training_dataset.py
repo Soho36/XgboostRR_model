@@ -1,226 +1,293 @@
 """
-build_training_dataset.py
-=========================
-Builds a training-ready CSV from:
-  - trade_stats.csv    (MAE, MFE, SL distance per trade)
-  - Trades.xlsx        (entry prices, exit reasons)
-  - OHLCV 1-min CSV   (market context features)
+build_training_dataset_v2.py
+============================
+Candle-based feature pipeline for the Red Candle Breakout strategy.
 
-Output: training_dataset.csv
-  One row per completed trade.
-  Columns: features computed at entry + rr_bucket label (0/1/2/3).
+Strategy recap:
+  - A red candle forms (close < open)
+  - Buy stop placed at candle HIGH
+  - SL placed at candle LOW
+  - SL = candle HIGH - LOW  (= candle range)
+  - achievable_rr = MFE / SL
 
-Usage:
-  python build_training_dataset.py
+Features describe ONLY what a trader can see at the moment the entry triggers:
+  - The triggering red candle's own shape/size
+  - The N candles immediately before it (context/momentum)
+  - Structure: where is price relative to recent swing high
+  - All values normalized — no absolute prices
 
-Edit the CONFIGURATION section below to match your file paths.
+Output: training_dataset_v2.csv
 """
 
 import pandas as pd
 import numpy as np
 import io
+import time
 
-# ── CONFIGURATION ────────────────────────────────────────────────────────────
+start_time = time.time()  # Start the timer
 
-TRADE_STATS_FILE = "file_examples/trade_stats.csv"  # MAE/MFE/SL file from MT5
-TRADES_FILE = "file_examples/Trades.xlsx"  # Deal log from MT5
-OHLCV_FILE = "file_examples/MT5_databento-ohlcv-1m.csv"  # 1-min OHLCV
+# ── CONFIGURATION ─────────────────────────────────────────────────────────────
 
-OUTPUT_FILE = "training_dataset.csv"
+TRADE_STATS_FILE = "input_files/trade_stats.csv"
+OHLCV_FILE = "input_files/MT5_databento-ohlcv-1m.csv"
+OUTPUT_FILE = "output_files/training_dataset_v2.csv"
 
-# RR bucket boundaries  [0, low, mid, high, inf]
-# Trades with achievable RR in each range get label 0/1/2/3
+# RR bucket boundaries
 RR_BINS = [0.0, 1.0, 2.0, 3.0, np.inf]
 RR_LABELS = [0, 1, 2, 3]
 
-# How many 1-min bars to load BEFORE each entry for feature computation
-LOOKBACK_BARS = 300  # ~5 hours of 1-min data
+# How many candles BEFORE the trigger candle to use as context
+CONTEXT_BARS = 20  # gives enough for ATR and swing detection
 
-# ── STEP 1: LOAD TRADE STATS ─────────────────────────────────────────────────
+
+# ── LOAD TRADE STATS ──────────────────────────────────────────────────────────
+
+def load_trade_stats(filepath):
+    """Robust loader — handles MT5 summary/footer rows and encoding variants."""
+    for enc in ["utf-16-le", "utf-16", "utf-8-sig", "utf-8"]:
+        try:
+            with open(filepath, "r", encoding=enc) as f:
+                raw = f.read()
+            df = pd.read_csv(io.StringIO(raw), sep="\t")
+            print(f"  Encoding: {enc}")
+            break
+        except Exception:
+            continue
+    else:
+        raise RuntimeError(f"Cannot read {filepath}")
+
+    # if "Unnamed: 6" in df.columns:
+    #     df = df.rename(columns={"Unnamed: 6": "SL_distance"})
+
+    # Drop summary/footer rows — they have non-date values in timestamp columns
+    date_pat = r"^\d{4}\.\d{2}\.\d{2}"
+    before = len(df)
+    df = df[df["Entry_time"].astype(str).str.match(date_pat)]
+    df = df[df["Exit_time"].astype(str).str.match(date_pat)]
+    if before - len(df):
+        print(f"  Dropped {before - len(df)} non-trade rows (MT5 footer/summary lines)")
+
+    df["Entry_time"] = pd.to_datetime(df["Entry_time"], format="%Y.%m.%d %H:%M:%S")
+    df["Exit_time"] = pd.to_datetime(df["Exit_time"], format="%Y.%m.%d %H:%M:%S")
+    df = df[df["SL"].notna() & (df["SL"] > 0)].copy()
+    return df
+
 
 print("Loading trade_stats.csv ...")
+stats = load_trade_stats(TRADE_STATS_FILE)
+print(f"  {len(stats)} trades loaded.")
 
-# MT5 exports this file as UTF-16-LE with tab separation
-with open(TRADE_STATS_FILE, "r", encoding="utf-16-le") as f:
-    content = f.read()
-stats = pd.read_csv(io.StringIO(content), sep="\t")
-
-# Rename the unnamed SL-distance column
-# stats = stats.rename(columns={"Unnamed: 6": "SL"})
-
-# Parse timestamps
-stats["Entry_time"] = pd.to_datetime(stats["Entry_time"], format="%Y.%m.%d %H:%M:%S")
-stats["Exit_time"] = pd.to_datetime(stats["Exit_time"], format="%Y.%m.%d %H:%M:%S")
-
-# Drop rows where SL_distance is zero or missing (avoids divide-by-zero)
-stats = stats[stats["SL"].notna() & (stats["SL"] > 0)].copy()
-
-print(f"  {len(stats)} completed trades loaded.")
-
-# ── STEP 2: COMPUTE LABELS ───────────────────────────────────────────────────
+# ── LABELS ────────────────────────────────────────────────────────────────────
 
 print("Computing RR labels ...")
-
-# MFE is in price points (same units as SL_distance)
-stats["achievable_rr"] = stats["MFE"] / stats["SL"]
-
-# Clip negative MFE to 0 (trade never moved in our favour at all)
-stats["achievable_rr"] = stats["achievable_rr"].clip(lower=0)
-
+stats["achievable_rr"] = (stats["MFE"] / stats["SL"]).clip(lower=0)
 stats["rr_bucket"] = pd.cut(
-    stats["achievable_rr"],
-    bins=RR_BINS,
-    labels=RR_LABELS,
-    right=False  # [low, high)
+    stats["achievable_rr"], bins=RR_BINS, labels=RR_LABELS, right=False
 ).astype(int)
 
-label_counts = stats["rr_bucket"].value_counts().sort_index()
-print("  Label distribution:")
-for bucket, count in label_counts.items():
-    pct = count / len(stats) * 100
-    print(f"    Bucket {bucket}: {count} trades ({pct:.1f}%)")
+for b in RR_LABELS:
+    n = (stats["rr_bucket"] == b).sum()
+    print(f"  Bucket {b}: {n} trades ({n / len(stats) * 100:.1f}%)")
 
-# ── STEP 3: LOAD TRADES.XLSX FOR ENTRY PRICES ────────────────────────────────
+# ── LOAD OHLCV ────────────────────────────────────────────────────────────────
 
-print("Loading Trades.xlsx ...")
-
-trades_raw = pd.read_excel(TRADES_FILE, header=1)
-trades_raw["Time"] = pd.to_datetime(trades_raw["Time"], format="%Y.%m.%d %H:%M:%S")
-
-# Keep only entry rows (direction == 'in')
-entries = trades_raw[trades_raw["Direction"] == "in"][["Time", "Price"]].copy()
-entries = entries.rename(columns={"Time": "Entry_time", "Price": "entry_price"})
-entries["Entry_time"] = pd.to_datetime(entries["Entry_time"])
-
-# Merge entry price into stats
-stats = stats.merge(entries, on="Entry_time", how="left")
-
-missing_price = stats["entry_price"].isna().sum()
-if missing_price > 0:
-    print(f"  WARNING: {missing_price} trades missing entry price — they will have NaN entry_price feature.")
-
-print(f"  Entry prices joined.")
-
-# ── STEP 4: LOAD OHLCV ───────────────────────────────────────────────────────
-
-print("Loading OHLCV data (this may take a moment for 15 years of 1-min data) ...")
-
+print("\nLoading OHLCV ...")
 ohlcv = pd.read_csv(OHLCV_FILE, sep="\t")
-
-# Standardise column names
 ohlcv = ohlcv.rename(columns={
-    "<DATE>": "date",
-    "<TIME>": "time",
-    "<OPEN>": "open",
-    "<HIGH>": "high",
-    "<LOW>": "low",
-    "<CLOSE>": "close",
-    "<TICKVOL>": "volume",
-    "<VOL>": "vol",
-    "<SPREAD>": "spread",
+    "<DATE>": "date", "<TIME>": "time",
+    "<OPEN>": "open", "<HIGH>": "high", "<LOW>": "low",
+    "<CLOSE>": "close", "<TICKVOL>": "volume"
 })
-
 ohlcv["timestamp"] = pd.to_datetime(
     ohlcv["date"].astype(str) + " " + ohlcv["time"].astype(str),
     format="%Y.%m.%d %H:%M:%S"
 )
 ohlcv = ohlcv.set_index("timestamp").sort_index()
 ohlcv = ohlcv[["open", "high", "low", "close", "volume"]]
+print(f"  {len(ohlcv):,} bars: {ohlcv.index[0]} → {ohlcv.index[-1]}")
 
-print(f"  OHLCV loaded: {len(ohlcv):,} bars from {ohlcv.index[0]} to {ohlcv.index[-1]}")
 
+# ── HELPER FUNCTIONS ──────────────────────────────────────────────────────────
 
-# ── STEP 5: FEATURE COMPUTATION ──────────────────────────────────────────────
-
-def compute_atr(df, period=14):
-    """Average True Range using Wilder's EMA."""
+def atr(bars, period=14):
+    """ATR using Wilder EMA."""
     tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift(1)).abs(),
-        (df["low"] - df["close"].shift(1)).abs(),
+        bars["high"] - bars["low"],
+        (bars["high"] - bars["close"].shift(1)).abs(),
+        (bars["low"] - bars["close"].shift(1)).abs(),
     ], axis=1).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean()
+    return tr.ewm(span=period, adjust=False).mean().iloc[-1]
 
 
-def compute_features(entry_time, ohlcv_1m):
+def swing_high(bars, lookback=10):
+    """Highest high in the lookback window."""
+    return bars["high"].tail(lookback).max()
+
+
+def count_consecutive(series, condition_fn):
     """
-    Given an entry timestamp, look back into 1-min OHLCV and return
-    a dict of features computed strictly from pre-entry data.
+    Count how many bars from the END of `series` satisfy condition_fn
+    without interruption.
+    Example: consecutive red candles = count_consecutive(bars, lambda r: r['close'] < r['open'])
     """
-    feats = {}
+    count = 0
+    for _, row in series.iloc[::-1].iterrows():
+        if condition_fn(row):
+            count += 1
+        else:
+            break
+    return count
 
-    # Slice the lookback window (bars strictly before entry)
-    window = ohlcv_1m[ohlcv_1m.index < entry_time].tail(LOOKBACK_BARS)
 
-    if len(window) < 50:
-        # Not enough history — return NaNs; these rows will be dropped later
+# ── FEATURE COMPUTATION ───────────────────────────────────────────────────────
+
+def compute_features(entry_time, ohlcv):
+    """
+    All features computed from candles visible BEFORE entry fires.
+
+    The trigger candle is the last fully closed 1-min bar before entry_time.
+    Context candles are the CONTEXT_BARS bars before that.
+    """
+
+    # Slice: all bars up to (not including) the entry bar itself
+    # The entry bar opens after the trigger candle closes
+    pre_entry = ohlcv[ohlcv.index < entry_time]
+
+    if len(pre_entry) < CONTEXT_BARS + 5:
         return None
 
-    close = window["close"]
-    high = window["high"]
-    low = window["low"]
-    volume = window["volume"]
+    # ── Trigger candle (the red candle that set up the trade) ────────────────
+    tc = pre_entry.iloc[-1]  # last closed bar before entry
 
-    # ── Volatility features ──────────────────────────────────────────────────
+    tc_open = tc["open"]
+    tc_close = tc["close"]
+    tc_high = tc["high"]
+    tc_low = tc["low"]
+    tc_range = tc_high - tc_low  # = SL_distance
 
-    atr_series = compute_atr(window, period=14)
-    atr_now = atr_series.iloc[-1]
-    feats["atr_14"] = atr_now
+    if tc_range == 0:
+        return None
 
-    # ATR percentile rank: where does current ATR sit vs last 200 bars?
-    atr_history = atr_series.tail(200)
-    feats["atr_pctrank"] = float((atr_history < atr_now).mean())
+    tc_body = abs(tc_open - tc_close)
+    tc_upper_wick = tc_high - max(tc_open, tc_close)
+    tc_lower_wick = min(tc_open, tc_close) - tc_low
 
-    # Realised volatility: std of 1-min close-to-close returns
-    rets = close.pct_change().dropna()
-    feats["rvol_30"] = rets.tail(30).std()
-    feats["rvol_60"] = rets.tail(60).std()
-    feats["rvol_120"] = rets.tail(120).std()
+    # ── Context window (bars before the trigger candle) ──────────────────────
+    ctx = pre_entry.iloc[-(CONTEXT_BARS + 1):-1]  # CONTEXT_BARS bars before tc
 
-    # ── Trend / momentum features ────────────────────────────────────────────
+    # ATR of context window — our normalization unit
+    atr_val = atr(ctx, period=min(14, len(ctx) - 1))
+    if atr_val == 0:
+        return None
 
-    ema20 = close.ewm(span=20, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
-    ema200 = close.ewm(span=200, adjust=False).mean()
+    feats = {}
 
-    # EMA slopes (change over last 5 bars, normalised by price)
-    price_now = close.iloc[-1]
-    feats["ema20_slope"] = (ema20.iloc[-1] - ema20.iloc[-6]) / (price_now + 1e-9)
-    feats["ema50_slope"] = (ema50.iloc[-1] - ema50.iloc[-6]) / (price_now + 1e-9)
+    # ════════════════════════════════════════════════════════════════════════
+    # GROUP 1: Trigger candle shape
+    # These describe the exact candle the strategy is based on.
+    # ════════════════════════════════════════════════════════════════════════
 
-    # Price position relative to EMAs
-    feats["price_vs_ema20"] = (price_now - ema20.iloc[-1]) / (atr_now + 1e-9)
-    feats["price_vs_ema50"] = (price_now - ema50.iloc[-1]) / (atr_now + 1e-9)
-    feats["price_vs_ema200"] = (price_now - ema200.iloc[-1]) / (atr_now + 1e-9)
+    # Body as fraction of total range: 1.0 = full marubozu, 0 = doji
+    feats["tc_body_ratio"] = tc_body / tc_range
 
-    # EMA alignment: 20 vs 50 (positive = uptrend stack)
-    feats["ema20_vs_ema50"] = (ema20.iloc[-1] - ema50.iloc[-1]) / (atr_now + 1e-9)
+    # Wick ratios: where did price reject within the candle?
+    feats["tc_upper_wick_ratio"] = tc_upper_wick / tc_range
+    feats["tc_lower_wick_ratio"] = tc_lower_wick / tc_range
 
-    # ── Range / structure features ───────────────────────────────────────────
+    # Is this candle large or small vs recent volatility?
+    # >1 = bigger than average, <1 = smaller
+    feats["tc_size_vs_atr"] = tc_range / atr_val
 
-    # Where is price within the last 20-bar high/low range?  0=bottom, 1=top
-    high20 = high.tail(20).max()
-    low20 = low.tail(20).min()
-    range20 = high20 - low20
-    feats["price_in_range_20"] = (price_now - low20) / (range20 + 1e-9)
+    # Is it bigger or smaller than the 3 candles just before it?
+    ctx3_avg_range = (ctx["high"] - ctx["low"]).tail(3).mean()
+    feats["tc_size_vs_prior3"] = tc_range / (ctx3_avg_range + 1e-9)
 
-    # Same for 60-bar range
-    high60 = high.tail(60).max()
-    low60 = low.tail(60).min()
-    range60 = high60 - low60
-    feats["price_in_range_60"] = (price_now - low60) / (range60 + 1e-9)
+    # Volume on the trigger candle vs 20-bar average
+    ctx_vol_avg = ctx["volume"].mean()
+    feats["tc_vol_ratio"] = tc["volume"] / (ctx_vol_avg + 1e-9)
 
-    # Last bar's range relative to ATR (expansion/contraction signal)
-    last_bar_range = high.iloc[-1] - low.iloc[-1]
-    feats["bar_range_vs_atr"] = last_bar_range / (atr_now + 1e-9)
+    # ════════════════════════════════════════════════════════════════════════
+    # GROUP 2: The candles immediately before — momentum/context
+    # ════════════════════════════════════════════════════════════════════════
 
-    # ── Volume features ──────────────────────────────────────────────────────
+    # Direction of each of the 5 candles before trigger: +1 bull, -1 bear
+    # These capture the "is this a deep pullback or a one-candle dip" question
+    for i, n in enumerate([1, 2, 3, 4, 5]):
+        bar = ctx.iloc[-n] if len(ctx) >= n else None
+        if bar is not None:
+            feats[f"prior_{n}_direction"] = 1.0 if bar["close"] >= bar["open"] else -1.0
+            feats[f"prior_{n}_size_vs_atr"] = (bar["high"] - bar["low"]) / atr_val
+        else:
+            feats[f"prior_{n}_direction"] = 0.0
+            feats[f"prior_{n}_size_vs_atr"] = 0.0
 
-    vol_mean_20 = volume.tail(20).mean()
-    vol_now = volume.iloc[-1]
-    feats["vol_ratio"] = vol_now / (vol_mean_20 + 1e-9)  # >1 = above-average volume
+    # How many consecutive red candles immediately before the trigger?
+    # (a long red run = deep momentum; 0 = isolated red candle after greens)
+    feats["consecutive_red_before"] = count_consecutive(
+        ctx, lambda r: r["close"] < r["open"]
+    )
 
-    # ── Time features (cyclical encoding) ───────────────────────────────────
+    # Average direction of last 5 context bars: +1 = all green, -1 = all red
+    last5 = ctx.tail(5)
+    feats["prior5_avg_direction"] = (
+        (last5["close"] - last5["open"]).apply(np.sign).mean()
+    )
+
+    # Momentum: did the candles before trigger close progressively lower?
+    # (slope of closes, normalised)
+    if len(ctx) >= 5:
+        closes5 = ctx["close"].tail(5).values
+        slope = np.polyfit(range(5), closes5, 1)[0]
+        feats["prior5_close_slope"] = slope / atr_val
+    else:
+        feats["prior5_close_slope"] = 0.0
+
+    # ════════════════════════════════════════════════════════════════════════
+    # GROUP 3: Structure — where is price relative to recent key levels?
+    # ════════════════════════════════════════════════════════════════════════
+
+    # Distance from entry (trigger candle HIGH) to recent swing high
+    # If the last swing high is just above entry, MFE is capped
+    sh10 = swing_high(ctx, lookback=10)
+    sh20 = swing_high(ctx, lookback=20)
+
+    feats["dist_to_swing_high_10"] = (sh10 - tc_high) / atr_val
+    feats["dist_to_swing_high_20"] = (sh20 - tc_high) / atr_val
+
+    # How far has price pulled back to form this trigger candle?
+    # Deep pullbacks from a swing high = more room to recover
+    feats["pullback_depth"] = (sh20 - tc_close) / atr_val
+
+    # Where is the trigger candle's HIGH within the recent 20-bar range?
+    # 0 = at the bottom, 1 = at the top
+    range_high = ctx["high"].tail(20).max()
+    range_low = ctx["low"].tail(20).min()
+    range_span = range_high - range_low
+    feats["entry_in_range_20"] = (tc_high - range_low) / (range_span + 1e-9)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # GROUP 4: Volatility regime at time of entry
+    # ════════════════════════════════════════════════════════════════════════
+
+    # ATR percentile: is current volatility high or low vs recent history?
+    # Use 60-bar ATR history
+    if len(pre_entry) >= 74:
+        atr_history = []
+        for j in range(60):
+            window = pre_entry.iloc[-(75 + j):-(14 + j)]
+            if len(window) >= 15:
+                atr_history.append(atr(window, period=14))
+        if atr_history:
+            feats["atr_pctrank"] = float((np.array(atr_history) < atr_val).mean())
+        else:
+            feats["atr_pctrank"] = 0.5
+    else:
+        feats["atr_pctrank"] = 0.5
+
+    # ════════════════════════════════════════════════════════════════════════
+    # GROUP 5: Time of day (cyclical)
+    # Kept because session timing genuinely affects how far breakouts run
+    # ════════════════════════════════════════════════════════════════════════
 
     hour = entry_time.hour + entry_time.minute / 60.0
     feats["hour_sin"] = np.sin(2 * np.pi * hour / 24)
@@ -231,85 +298,72 @@ def compute_features(entry_time, ohlcv_1m):
     return feats
 
 
-# ── STEP 6: BUILD DATASET ROW BY ROW ─────────────────────────────────────────
+# ── BUILD DATASET ─────────────────────────────────────────────────────────────
 
-print(f"Computing features for {len(stats)} trades ...")
-print("  (This is the slow step — one lookback slice per trade)")
+print(f"\nComputing candle features for {len(stats)} trades ...")
 
 rows = []
 skipped = 0
 
 for i, trade in stats.iterrows():
     entry_time = trade["Entry_time"]
-
     feats = compute_features(entry_time, ohlcv)
 
     if feats is None:
         skipped += 1
         continue
 
-    # Add label and metadata
     feats["entry_time"] = entry_time
-    feats["exit_time"] = trade["Exit_time"]
-    feats["entry_price"] = trade.get("entry_price", np.nan)
     feats["mae"] = trade["MAE"]
     feats["mfe"] = trade["MFE"]
     feats["pnl"] = trade["PNL"]
-    feats["sl_distance"] = trade["SL"]
+    feats["sl"] = trade["SL"]
     feats["achievable_rr"] = trade["achievable_rr"]
     feats["rr_bucket"] = trade["rr_bucket"]
-
     rows.append(feats)
 
-    if (len(rows) % 500) == 0:
-        print(f"  ... {len(rows)} trades processed")
+    if len(rows) % 1000 == 0:
+        print(f"  ... {len(rows)} trades done")
 
-print(f"  Done. {len(rows)} trades processed, {skipped} skipped (insufficient history).")
+print(f"  Done. {len(rows)} processed, {skipped} skipped.")
 
-# ── STEP 7: SAVE ─────────────────────────────────────────────────────────────
+# ── SAVE ──────────────────────────────────────────────────────────────────────
 
 dataset = pd.DataFrame(rows)
 
 if dataset.empty:
-    print("\nERROR: No trades were processed.")
-    print("Most likely cause: the OHLCV file date range does not overlap with your trade dates.")
-    print(f"  OHLCV range : {ohlcv.index[0]} → {ohlcv.index[-1]}")
-    print(f"  Trade range : {stats['Entry_time'].min()} → {stats['Entry_time'].max()}")
-    print("Make sure you are using your full OHLCV file, not the sample excerpt.")
+    print("\nERROR: No trades processed — OHLCV date range likely doesn't overlap trades.")
+    print(f"  OHLCV: {ohlcv.index[0]} → {ohlcv.index[-1]}")
+    print(f"  Trades: {stats['Entry_time'].min()} → {stats['Entry_time'].max()}")
     raise SystemExit(1)
 
 dataset = dataset.sort_values("entry_time").reset_index(drop=True)
-
-# Drop any rows with NaN features (shouldn't be many)
-n_before = len(dataset)
-dataset = dataset.dropna(subset=[c for c in dataset.columns if c not in
-                                 ["entry_time", "exit_time", "entry_price"]])
-n_after = len(dataset)
-if n_before != n_after:
-    print(f"  Dropped {n_before - n_after} rows with NaN features.")
-
 dataset.to_csv(OUTPUT_FILE, index=False)
-print(f"\nSaved: {OUTPUT_FILE}  ({len(dataset)} rows x {len(dataset.columns)} columns)")
-
-# ── STEP 8: QUICK SUMMARY ────────────────────────────────────────────────────
-
-print("\n── Dataset Summary ─────────────────────────────────────────────────────")
-print(f"  Date range : {dataset['entry_time'].min()} → {dataset['entry_time'].max()}")
-print(f"  Total trades: {len(dataset)}")
-print(f"\n  Label distribution:")
-for b in RR_LABELS:
-    n = (dataset["rr_bucket"] == b).sum()
-    pct = n / len(dataset) * 100
-    rr_lo = RR_BINS[b]
-    rr_hi = RR_BINS[b + 1] if RR_BINS[b + 1] != np.inf else "∞"
-    print(f"    Bucket {b}  (RR {rr_lo}–{rr_hi}): {n:4d} trades  ({pct:.1f}%)")
 
 feature_cols = [c for c in dataset.columns if c not in
-                ["entry_time", "exit_time", "entry_price", "mae", "mfe", "pnl",
-                 "sl_distance", "achievable_rr", "rr_bucket"]]
-print(f"\n  Feature columns ({len(feature_cols)}):")
-for fc in feature_cols:
-    print(f"    {fc}")
+                ["entry_time", "mae", "mfe", "pnl", "sl_distance", "achievable_rr", "rr_bucket"]]
 
-print("\nDone! Next step: feed training_dataset.csv into XGBoost.")
-print("See the train_model.py script for that.")
+print(f"\nSaved: {OUTPUT_FILE}")
+print(f"  {len(dataset)} rows  x  {len(dataset.columns)} columns")
+print(f"  {len(feature_cols)} features:")
+
+# Print features grouped
+groups = {
+    "Trigger candle shape": [f for f in feature_cols if f.startswith("tc_")],
+    "Prior candle context": [f for f in feature_cols if f.startswith("prior") or f.startswith("consecutive")],
+    "Structure / levels": [f for f in feature_cols if "swing" in f or "pullback" in f or "range" in f],
+    "Volatility regime": [f for f in feature_cols if "atr" in f],
+    "Time": [f for f in feature_cols if "hour" in f or "dow" in f],
+}
+for group, cols in groups.items():
+    print(f"\n  [{group}]")
+    for c in cols:
+        print(f"    {c}")
+
+print("\nDone! Now run train_model.py")
+
+elapsed_time = time.time() - start_time  # Calculate elapsed time
+elapsed_hours = int(elapsed_time // 3600)
+elapsed_minutes = int(elapsed_time // 60)
+elapsed_seconds = elapsed_time % 60
+print(f"\nExecution time: {elapsed_hours} hours {elapsed_minutes} minutes {elapsed_seconds:.2f} seconds")
