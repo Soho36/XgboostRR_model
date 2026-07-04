@@ -6,3 +6,6 @@
 /plots/
 rr_model.json
 feature_importance.csv
+/Optimization_xlmls/
+/archive_xgboost/output_files/
+/archive_xgboost/plots/
