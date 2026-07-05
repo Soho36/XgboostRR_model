@@ -18,12 +18,12 @@ Pick your prop DD ceiling below (MAX_DD_PCT). The 'capped' recommendation is the
 most profitable RR whose Equity-DD% stays under that ceiling.
 """
 
-import glob, os
+import glob
+import os
 import xml.etree.ElementTree as ET
-# import numpy as np
-import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
+import pandas as pd
 
 matplotlib.use("Agg")
 
@@ -34,6 +34,8 @@ OUT_CSV = "output_files/window_rr_recommendations.csv"
 MAX_DD_USD = 2000.0  # per-account prop drawdown ceiling in $ (at tester lot size)
 MIN_TRADES = 100     # ignore passes with fewer trades (safety)
 MIN_RECOVERY = 2.0   # a window whose best pass earns < this x its own maxDD = WEAK
+SMOOTH_RR = 0.10     # half-width (in RR units) for plateau smoothing / neighborhood
+ROBUST_MIN_FRAC = 0.70  # >= this share of the RR neighborhood must stay under the DD cap = 'solid'
 
 SS = "urn:schemas-microsoft-com:office:spreadsheet"
 
@@ -71,7 +73,26 @@ def parse_mt5_xml(path):
         df["dd_usd"] = (df["profit"] / df["recovery"]).where(
             (df["recovery"] > 0) & (df["profit"] > 0))
     df = df.dropna(subset=["rr", "profit"]).sort_values("rr").reset_index(drop=True)
+    # plateau smoothing: rolling mean over a +/- SMOOTH_RR neighbourhood, so an
+    # isolated spike gets averaged down by its neighbours (robustness).
+    step = df["rr"].diff().median()
+    win = max(3, int(round(2 * SMOOTH_RR / step)) | 1) if step and step > 0 else 3
+    for c in ["profit", "dd_usd", "recovery"]:
+        if c in df.columns:
+            df[c + "_s"] = df[c].rolling(win, center=True, min_periods=max(3, win // 3)).mean()
     return df
+
+
+def robustness(df, rr0):
+    """How solid is the pick? Share of the +/-SMOOTH_RR neighbourhood that stays
+    under the DD cap, and profit variability there (coefficient of variation)."""
+    nb = df[(df["rr"] - rr0).abs() <= SMOOTH_RR]
+    if nb.empty:
+        return float("nan"), float("nan")
+    frac_under = float((nb["dd_usd"] <= MAX_DD_USD).mean())
+    m = nb["profit"].mean()
+    cv = float(nb["profit"].std() / m) if m else float("nan")
+    return frac_under, cv
 
 
 def pick(df, col, maximize=True):
@@ -92,11 +113,12 @@ def recommend(df):
     out["maxRecovery"] = r
     r = pick(df, "sharpe");
     out["maxSharpe"] = r
-    # 3. prop recommendation: best risk-adjusted (Recovery Factor) RR whose
-    #    $ drawdown stays under the ceiling — the knee, not the edge of the cliff
-    allowed = df[(df["dd_usd"] <= MAX_DD_USD) & df["dd_usd"].notna()
+    # 3. prop recommendation: best SMOOTHED recovery whose SMOOTHED $ drawdown
+    #    stays under the ceiling. Using smoothed series means the pick's whole
+    #    neighbourhood must be under the cap — a spike alone won't qualify.
+    allowed = df[(df["dd_usd_s"] <= MAX_DD_USD) & df["dd_usd_s"].notna()
                  & (df["trades"] >= MIN_TRADES)]
-    out["recommended"] = allowed.loc[allowed["recovery"].idxmax()] if not allowed.empty else None
+    out["recommended"] = allowed.loc[allowed["recovery_s"].idxmax()] if not allowed.empty else None
     return out
 
 
@@ -116,6 +138,20 @@ def plot_window(name, df, rec):
     ax2.set_ylabel("Max Drawdown $", color="tab:red")
     ax2.tick_params(axis="y", labelcolor="tab:red")
 
+    # shade contiguous RR ranges that sit UNDER the DD cap (the usable plateaus)
+    mask = (df["dd_usd"] <= MAX_DD_USD).fillna(False).values
+    rr = df["rr"].values
+    i = 0
+    while i < len(mask):
+        if mask[i]:
+            j = i
+            while j + 1 < len(mask) and mask[j + 1]:
+                j += 1
+            ax1.axvspan(rr[i], rr[j], color="green", alpha=0.07)
+            i = j + 1
+        else:
+            i += 1
+
     colors = {"maxProfit": "grey", "maxRecovery": "tab:green",
               "maxSharpe": "tab:purple", "recommended": "black"}
     for key, r in rec.items():
@@ -125,9 +161,10 @@ def plot_window(name, df, rec):
     ax1.set_title(f"Window {name} — RR sweep  (trades={int(df['trades'].median())})")
     ax1.legend(loc="upper left", fontsize=8)
 
-    # bottom: risk-adjusted curves
-    ax3.plot(df["rr"], df["recovery"], color="tab:green", lw=1.6, label="Recovery Factor")
-    ax3.plot(df["rr"], df["sharpe"], color="tab:purple", lw=1.6, label="Sharpe Ratio")
+    # bottom: risk-adjusted curves (raw + smoothed recovery to show the plateau)
+    ax3.plot(df["rr"], df["recovery"], color="tab:green", lw=1.0, alpha=0.4, label="Recovery (raw)")
+    ax3.plot(df["rr"], df["recovery_s"], color="tab:green", lw=2.0, label="Recovery (smoothed)")
+    ax3.plot(df["rr"], df["sharpe"], color="tab:purple", lw=1.2, alpha=0.7, label="Sharpe Ratio")
     ax3.plot(df["rr"], df["pf"], color="tab:orange", lw=1.2, alpha=0.8, label="Profit Factor")
     ax3.set_xlabel("RiskReward")
     ax3.set_ylabel("risk-adjusted")
@@ -163,24 +200,36 @@ for p in paths:
             row[f"{key}_RR"] = round(float(r["rr"]), 2)
             row[f"{key}_profit"] = round(float(r["profit"]), 0)
             row[f"{key}_DD$"] = round(float(r["dd_usd"]), 0) if pd.notna(r.get("dd_usd")) else None
-    # verdict under the $ ceiling
+    # robustness of the recommended pick: how solid is its neighbourhood?
     mp, rc = rec["maxProfit"], rec["recommended"]
+    robust = None
+    if rc is not None:
+        frac, cv = robustness(df, rc["rr"])
+        row["plateau_under_cap%"] = round(frac * 100) if pd.notna(frac) else None
+        row["nbhd_cv"] = round(cv, 2) if pd.notna(cv) else None
+        robust = "solid" if (pd.notna(frac) and frac >= ROBUST_MIN_FRAC) else "fragile"
+        row["robust"] = robust
+    # verdict under the $ ceiling
     if mp is None or mp["profit"] <= 0:
         row["verdict"] = "LOSING"
     elif rc is None:
         row["verdict"] = "EXCEEDS_DD"
-    elif rc["recovery"] < MIN_RECOVERY:
+    elif rc["recovery_s"] < MIN_RECOVERY:
         row["verdict"] = "WEAK"
     else:
         row["verdict"] = "OK"
     summary.append(row)
-    print(f"\n-- Window {name}  (trades={row['trades']})  verdict={row['verdict']} --")
+    tag = f"{row['verdict']}" + (f"/{robust}" if robust else "")
+    print(f"\n-- Window {name}  (trades={row['trades']})  {tag} --")
     for key, r in rec.items():
         if r is not None:
             ddv = r.get("dd_usd")
             dds = f"${ddv:>7,.0f}" if pd.notna(ddv) else "    n/a"
             print(f"   {key:<12} RR={r['rr']:.2f}  profit=${r['profit']:>8,.0f}  "
                   f"maxDD={dds}  recovery={r['recovery']:.2f}  sharpe={r['sharpe']:.2f}")
+    if rc is not None:
+        print(f"   robustness: {row.get('plateau_under_cap%')}% of +/-{SMOOTH_RR} RR neighbourhood under cap"
+              f"  (profit CV={row.get('nbhd_cv')})  -> {robust}")
     print(f"   plot: {png}")
 
 if summary:

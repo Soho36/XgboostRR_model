@@ -1,5 +1,6 @@
 /venv/
 /.idea/
+/__pycache__/
 /file_examples/
 /input_files/
 /output_files/
