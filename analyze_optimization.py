@@ -28,7 +28,13 @@ import pandas as pd
 matplotlib.use("Agg")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-XML_DIR = "Optimization_xlmls"
+XML_DIR = "Optimization_xlms"
+# Two-period layout (optional). If these subfolders exist inside XML_DIR, PRIMARY
+# drives the live RR picks and REFERENCE is used only for a regime-stability
+# comparison. If neither exists, flat XML_DIR is the single (primary) period.
+PRIMARY_SUBDIR = "recent"   # e.g. 2020-2026 optimizations  (the market you trade)
+REF_SUBDIR = "full"         # e.g. 2010-2026 optimizations  (calm-market reference)
+REGIME_RR_TOL = 0.40        # |recommended_RR primary - reference| above this = regime-sensitive
 PLOT_DIR = "plots/optimization"
 OUT_CSV = "output_files/window_rr_recommendations.csv"
 MAX_DD_USD = 2000.0  # per-account prop drawdown ceiling in $ (at tester lot size)
@@ -104,27 +110,38 @@ def pick(df, col, maximize=True):
 
 
 def recommend(df):
+    """Tiered picks for a trailing-DD prop account.
+
+    Phase 1 (new account, DD trailing active -> must stay under the $ cap):
+        recommended = safest, best smoothed recovery under the cap
+        aggressive  = most profit on a still-under-cap smoothed plateau
+    Phase 2 (buffer banked, trailing DD frozen -> cap no longer binds):
+        unlocked    = best smoothed recovery ignoring the cap
+    """
     out = {}
-    # 1. what MT5 highlights: max profit (DD-blind)
-    r = pick(df, "profit");
-    out["maxProfit"] = r
-    # 2. best risk-adjusted: recovery factor (= profit / maxDD) and sharpe
-    r = pick(df, "recovery");
-    out["maxRecovery"] = r
-    r = pick(df, "sharpe");
-    out["maxSharpe"] = r
-    # 3. prop recommendation: best SMOOTHED recovery whose SMOOTHED $ drawdown
-    #    stays under the ceiling. Using smoothed series means the pick's whole
-    #    neighbourhood must be under the cap — a spike alone won't qualify.
-    allowed = df[(df["dd_usd_s"] <= MAX_DD_USD) & df["dd_usd_s"].notna()
-                 & (df["trades"] >= MIN_TRADES)]
-    out["recommended"] = allowed.loc[allowed["recovery_s"].idxmax()] if not allowed.empty else None
+    base = df[df["trades"] >= MIN_TRADES] if "trades" in df else df
+    # under-cap = ACTUAL dd under the hard limit AND its neighbourhood (smoothed) too
+    under = base[(base["dd_usd"] <= MAX_DD_USD) & (base["dd_usd_s"] <= MAX_DD_USD)
+                 & base["dd_usd"].notna() & base["dd_usd_s"].notna()]
+
+    def amax(d, col):
+        d = d[d[col].notna()]
+        return d.loc[d[col].idxmax()] if not d.empty else None
+
+    # diagnostics (raw, DD-blind)
+    out["maxProfit"] = amax(base, "profit")
+    out["maxRecovery"] = amax(base, "recovery")
+    # Phase-1 picks (under the $ cap)
+    out["recommended"] = amax(under, "recovery_s")
+    out["aggressive"] = amax(under, "profit_s")
+    # Phase-2 pick (cap ignored — for seasoned accounts / 'saved for later')
+    out["unlocked"] = amax(base, "recovery_s")
     return out
 
 
 # ── PLOT ──────────────────────────────────────────────────────────────────────
-def plot_window(name, df, rec):
-    os.makedirs(PLOT_DIR, exist_ok=True)
+def plot_window(name, df, rec, plot_dir=PLOT_DIR):
+    os.makedirs(plot_dir, exist_ok=True)
     fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
 
     # top: profit (left axis) + DD% (right axis)
@@ -152,9 +169,10 @@ def plot_window(name, df, rec):
         else:
             i += 1
 
-    colors = {"maxProfit": "grey", "maxRecovery": "tab:green",
-              "maxSharpe": "tab:purple", "recommended": "black"}
-    for key, r in rec.items():
+    colors = {"recommended": "black", "aggressive": "tab:blue",
+              "unlocked": "tab:orange", "maxProfit": "grey"}
+    for key in ["recommended", "aggressive", "unlocked", "maxProfit"]:
+        r = rec.get(key)
         if r is not None:
             ax1.axvline(r["rr"], color=colors[key], ls="--", lw=1.3,
                         label=f"{key}: RR={r['rr']:.2f} (DD=${r['dd_usd']:,.0f})")
@@ -172,80 +190,106 @@ def plot_window(name, df, rec):
     ax3.legend(loc="best", fontsize=8)
 
     fig.tight_layout()
-    p = os.path.join(PLOT_DIR, f"{name}.png")
+    p = os.path.join(plot_dir, f"{name}.png")
     fig.savefig(p, dpi=110)
     plt.close(fig)
     return p
 
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
-paths = sorted(glob.glob(os.path.join(XML_DIR, "*.xml")))
-if not paths:
-    raise SystemExit(f"No XMLs in {XML_DIR}/. Export MT5 optimization results there.")
+# ── PROCESS ONE PERIOD (a folder of window XMLs) ──────────────────────────────
+def process_dir(xml_dir, plot_dir, verbose=True):
+    summary = []
+    for p in sorted(glob.glob(os.path.join(xml_dir, "*.xml"))):
+        name = os.path.splitext(os.path.basename(p))[0].replace("_opt", "")
+        df = parse_mt5_xml(p)
+        if df is None or df.empty:
+            if verbose:
+                print(f"  {name}: could not parse — skipped")
+            continue
+        rec = recommend(df)
+        png = plot_window(name, df, rec, plot_dir)
+        row = {"window": name, "rr_lo": df["rr"].min(), "rr_hi": df["rr"].max(),
+               "trades": int(df["trades"].median())}
+        for key, r in rec.items():
+            if r is not None:
+                row[f"{key}_RR"] = round(float(r["rr"]), 2)
+                row[f"{key}_profit"] = round(float(r["profit"]), 0)
+                row[f"{key}_DD$"] = round(float(r["dd_usd"]), 0) if pd.notna(r.get("dd_usd")) else None
+        mp, rc = rec["maxProfit"], rec["recommended"]
+        robust = None
+        if rc is not None:
+            frac, cv = robustness(df, rc["rr"])
+            row["plateau_under_cap%"] = round(frac * 100) if pd.notna(frac) else None
+            row["nbhd_cv"] = round(cv, 2) if pd.notna(cv) else None
+            robust = "solid" if (pd.notna(frac) and frac >= ROBUST_MIN_FRAC) else "fragile"
+            row["robust"] = robust
+        if mp is None or mp["profit"] <= 0:
+            row["verdict"] = "LOSING"
+        elif rc is None:
+            row["verdict"] = "UNLOCK_ONLY"
+        elif rc["recovery_s"] < MIN_RECOVERY:
+            row["verdict"] = "WEAK"
+        else:
+            row["verdict"] = "OK"
+        summary.append(row)
+        if verbose:
+            tag = f"{row['verdict']}" + (f"/{robust}" if robust else "")
+            print(f"\n-- Window {name}  (trades={row['trades']})  {tag} --")
+            for key, r in rec.items():
+                if r is not None:
+                    ddv = r.get("dd_usd")
+                    dds = f"${ddv:>7,.0f}" if pd.notna(ddv) else "    n/a"
+                    print(f"   {key:<12} RR={r['rr']:.2f}  profit=${r['profit']:>8,.0f}  "
+                          f"maxDD={dds}  recovery={r['recovery']:.2f}  sharpe={r['sharpe']:.2f}")
+    return pd.DataFrame(summary)
 
-os.makedirs("output_files", exist_ok=True)
-summary = []
-for p in paths:
-    name = os.path.splitext(os.path.basename(p))[0].replace("_opt", "")
-    df = parse_mt5_xml(p)
-    if df is None or df.empty:
-        print(f"  {name}: could not parse — skipped")
-        continue
-    rec = recommend(df)
-    png = plot_window(name, df, rec)
-    row = {"window": name, "rr_lo": df["rr"].min(), "rr_hi": df["rr"].max(),
-           "trades": int(df["trades"].median())}
-    for key, r in rec.items():
-        if r is not None:
-            row[f"{key}_RR"] = round(float(r["rr"]), 2)
-            row[f"{key}_profit"] = round(float(r["profit"]), 0)
-            row[f"{key}_DD$"] = round(float(r["dd_usd"]), 0) if pd.notna(r.get("dd_usd")) else None
-    # robustness of the recommended pick: how solid is its neighbourhood?
-    mp, rc = rec["maxProfit"], rec["recommended"]
-    robust = None
-    if rc is not None:
-        frac, cv = robustness(df, rc["rr"])
-        row["plateau_under_cap%"] = round(frac * 100) if pd.notna(frac) else None
-        row["nbhd_cv"] = round(cv, 2) if pd.notna(cv) else None
-        robust = "solid" if (pd.notna(frac) and frac >= ROBUST_MIN_FRAC) else "fragile"
-        row["robust"] = robust
-    # verdict under the $ ceiling
-    if mp is None or mp["profit"] <= 0:
-        row["verdict"] = "LOSING"
-    elif rc is None:
-        row["verdict"] = "EXCEEDS_DD"
-    elif rc["recovery_s"] < MIN_RECOVERY:
-        row["verdict"] = "WEAK"
-    else:
-        row["verdict"] = "OK"
-    summary.append(row)
-    tag = f"{row['verdict']}" + (f"/{robust}" if robust else "")
-    print(f"\n-- Window {name}  (trades={row['trades']})  {tag} --")
-    for key, r in rec.items():
-        if r is not None:
-            ddv = r.get("dd_usd")
-            dds = f"${ddv:>7,.0f}" if pd.notna(ddv) else "    n/a"
-            print(f"   {key:<12} RR={r['rr']:.2f}  profit=${r['profit']:>8,.0f}  "
-                  f"maxDD={dds}  recovery={r['recovery']:.2f}  sharpe={r['sharpe']:.2f}")
-    if rc is not None:
-        print(f"   robustness: {row.get('plateau_under_cap%')}% of +/-{SMOOTH_RR} RR neighbourhood under cap"
-              f"  (profit CV={row.get('nbhd_cv')})  -> {robust}")
-    print(f"   plot: {png}")
 
-if summary:
-    S = pd.DataFrame(summary)
+def save_csv(df, path):
     try:
-        S.to_csv(OUT_CSV, index=False)
-        out_path = OUT_CSV
+        df.to_csv(path, index=False)
+        return path
     except PermissionError:
         import time
-        out_path = OUT_CSV.replace(".csv", f"_{time.strftime('%H%M%S')}.csv")
-        S.to_csv(out_path, index=False)
-        print(f"  ({OUT_CSV} was locked — is it open in Excel? Wrote {out_path} instead.)")
+        alt = path.replace(".csv", f"_{time.strftime('%H%M%S')}.csv")
+        df.to_csv(alt, index=False)
+        print(f"  ({path} locked — open in Excel? Wrote {alt} instead.)")
+        return alt
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+os.makedirs("output_files", exist_ok=True)
+primary_dir = os.path.join(XML_DIR, PRIMARY_SUBDIR)
+ref_dir = os.path.join(XML_DIR, REF_SUBDIR)
+two_period = os.path.isdir(primary_dir) and glob.glob(os.path.join(primary_dir, "*.xml"))
+
+if two_period:
+    print(f"Two-period mode: PRIMARY={primary_dir}  REFERENCE={ref_dir}")
+    S = process_dir(primary_dir, os.path.join(PLOT_DIR, PRIMARY_SUBDIR))
+    if os.path.isdir(ref_dir) and glob.glob(os.path.join(ref_dir, "*.xml")):
+        R = process_dir(ref_dir, os.path.join(PLOT_DIR, REF_SUBDIR), verbose=False)
+        ref = R[["window", "recommended_RR", "verdict"]].rename(
+            columns={"recommended_RR": "ref_RR", "verdict": "ref_verdict"})
+        S = S.merge(ref, on="window", how="left")
+        # regime-stability: does the primary RR pick roughly hold in the reference era?
+        drr = (S["recommended_RR"] - S["ref_RR"]).abs()
+        S["regime"] = "n/a"
+        S.loc[drr.notna() & (drr <= REGIME_RR_TOL), "regime"] = "stable"
+        S.loc[drr.notna() & (drr > REGIME_RR_TOL), "regime"] = "SENSITIVE"
+        print("\n== Regime stability (primary vs reference recommended_RR) ==")
+        print(S[["window", "verdict", "recommended_RR", "ref_RR", "regime"]].to_string(index=False))
+else:
+    if not glob.glob(os.path.join(XML_DIR, "*.xml")):
+        raise SystemExit(f"No XMLs in {XML_DIR}/ (or its {PRIMARY_SUBDIR}/ subfolder).")
+    print(f"Single-period mode: {XML_DIR}  (put 2020-2026 in {PRIMARY_SUBDIR}/ and "
+          f"2010-2026 in {REF_SUBDIR}/ for regime comparison)")
+    S = process_dir(XML_DIR, PLOT_DIR)
+
+if len(S):
+    out_path = save_csv(S, OUT_CSV)
     print(f"\nSaved recommendations table → {out_path}")
     print(f"Plots → {PLOT_DIR}/")
-    n_ok = (S["verdict"] == "OK").sum()
-    print(f"\nWindows OK under ${MAX_DD_USD:,.0f} ceiling: {n_ok} / {len(S)}")
-    print("\nCAVEAT: this caps EACH window ALONE. Your $2k limit is PER ACCOUNT and each")
-    print("account runs ~2 windows/day — two windows can stack drawdowns. The real")
-    print("per-account check is the multi-account portfolio simulation (next step).")
+    print(f"\nVerdicts: {S['verdict'].value_counts().to_dict()}")
+    print("Tiers per window:  recommended_RR (safe, Phase 1) | aggressive_RR (more profit,"
+          " under cap) | unlocked_RR (Phase 2, cap ignored). UNLOCK_ONLY = seasoned-only.")
+    print("CAVEAT: caps EACH window alone; $2k is PER ACCOUNT and you stack ~2 windows/day"
+          " -> multi-account portfolio sim is the real per-account check (next step).")
