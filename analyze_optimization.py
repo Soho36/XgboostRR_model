@@ -29,6 +29,10 @@ matplotlib.use("Agg")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 XML_DIR = "Optimization_xlms"
+# Each strategy is its own subfolder of XML_DIR with its own inputs and output CSV.
+# RR = enter after last RED candle; GG = enter after last GREEN candle.
+# Add more strategy names here and drop a matching subfolder of XMLs to include them.
+STRATEGIES = ["RR", "GG"]
 # Two-period layout (optional). If these subfolders exist inside XML_DIR, PRIMARY
 # drives the live RR picks and REFERENCE is used only for a regime-stability
 # comparison. If neither exists, flat XML_DIR is the single (primary) period.
@@ -256,40 +260,60 @@ def save_csv(df, path):
         return alt
 
 
+# ── RUN ONE STRATEGY (its own inputs -> its own recommendations CSV) ──────────
+def run_strategy(name, base_dir, plot_base, out_csv):
+    primary_dir = os.path.join(base_dir, PRIMARY_SUBDIR)
+    ref_dir = os.path.join(base_dir, REF_SUBDIR)
+    two_period = os.path.isdir(primary_dir) and glob.glob(os.path.join(primary_dir, "*.xml"))
+
+    print(f"\n########################  STRATEGY: {name}  ########################")
+    if two_period:
+        print(f"Two-period mode: PRIMARY={primary_dir}  REFERENCE={ref_dir}")
+        S = process_dir(primary_dir, os.path.join(plot_base, PRIMARY_SUBDIR))
+        if os.path.isdir(ref_dir) and glob.glob(os.path.join(ref_dir, "*.xml")):
+            R = process_dir(ref_dir, os.path.join(plot_base, REF_SUBDIR), verbose=False)
+            ref = R[["window", "recommended_RR"]].rename(columns={"recommended_RR": "ref_RR"})
+            S = S.merge(ref, on="window", how="left")
+            drr = (S["recommended_RR"] - S["ref_RR"]).abs()
+            S["regime"] = "n/a"
+            S.loc[drr.notna() & (drr <= REGIME_RR_TOL), "regime"] = "stable"
+            S.loc[drr.notna() & (drr > REGIME_RR_TOL), "regime"] = "SENSITIVE"
+            print("\n== Regime stability (primary vs reference recommended_RR) ==")
+            print(S[["window", "verdict", "recommended_RR", "ref_RR", "regime"]].to_string(index=False))
+    else:
+        if not glob.glob(os.path.join(base_dir, "*.xml")):
+            print(f"  No XMLs in {base_dir}/ (or its {PRIMARY_SUBDIR}/ subfolder) — skipped.")
+            return
+        print(f"Single-period mode: {base_dir}  (add {PRIMARY_SUBDIR}/ + {REF_SUBDIR}/ "
+              f"subfolders for regime comparison)")
+        S = process_dir(base_dir, plot_base)
+
+    if len(S):
+        out_path = save_csv(S, out_csv)
+        print(f"\n[{name}] Saved recommendations → {out_path}   Plots → {plot_base}/")
+        print(f"[{name}] Verdicts: {S['verdict'].value_counts().to_dict()}")
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 os.makedirs("output_files", exist_ok=True)
-primary_dir = os.path.join(XML_DIR, PRIMARY_SUBDIR)
-ref_dir = os.path.join(XML_DIR, REF_SUBDIR)
-two_period = os.path.isdir(primary_dir) and glob.glob(os.path.join(primary_dir, "*.xml"))
+strat_dirs = [s for s in STRATEGIES
+              if os.path.isdir(os.path.join(XML_DIR, s))
+              and (glob.glob(os.path.join(XML_DIR, s, "*.xml"))
+                   or os.path.isdir(os.path.join(XML_DIR, s, PRIMARY_SUBDIR)))]
 
-if two_period:
-    print(f"Two-period mode: PRIMARY={primary_dir}  REFERENCE={ref_dir}")
-    S = process_dir(primary_dir, os.path.join(PLOT_DIR, PRIMARY_SUBDIR))
-    if os.path.isdir(ref_dir) and glob.glob(os.path.join(ref_dir, "*.xml")):
-        R = process_dir(ref_dir, os.path.join(PLOT_DIR, REF_SUBDIR), verbose=False)
-        ref = R[["window", "recommended_RR", "verdict"]].rename(
-            columns={"recommended_RR": "ref_RR", "verdict": "ref_verdict"})
-        S = S.merge(ref, on="window", how="left")
-        # regime-stability: does the primary RR pick roughly hold in the reference era?
-        drr = (S["recommended_RR"] - S["ref_RR"]).abs()
-        S["regime"] = "n/a"
-        S.loc[drr.notna() & (drr <= REGIME_RR_TOL), "regime"] = "stable"
-        S.loc[drr.notna() & (drr > REGIME_RR_TOL), "regime"] = "SENSITIVE"
-        print("\n== Regime stability (primary vs reference recommended_RR) ==")
-        print(S[["window", "verdict", "recommended_RR", "ref_RR", "regime"]].to_string(index=False))
+if strat_dirs:
+    for name in strat_dirs:
+        run_strategy(name, os.path.join(XML_DIR, name),
+                     os.path.join(PLOT_DIR, name),
+                     os.path.join("output_files", f"{name}_recommendations.csv"))
 else:
-    if not glob.glob(os.path.join(XML_DIR, "*.xml")):
-        raise SystemExit(f"No XMLs in {XML_DIR}/ (or its {PRIMARY_SUBDIR}/ subfolder).")
-    print(f"Single-period mode: {XML_DIR}  (put 2020-2026 in {PRIMARY_SUBDIR}/ and "
-          f"2010-2026 in {REF_SUBDIR}/ for regime comparison)")
-    S = process_dir(XML_DIR, PLOT_DIR)
+    # backward-compat: no strategy subfolders yet -> treat flat XML_DIR as one strategy
+    print(f"No strategy subfolders {STRATEGIES} found under {XML_DIR}/ — "
+          f"treating {XML_DIR}/ as a single strategy. (Move RR XMLs into {XML_DIR}/RR/ "
+          f"and GG XMLs into {XML_DIR}/GG/ to separate them.)")
+    run_strategy("RR", XML_DIR, PLOT_DIR, OUT_CSV)
 
-if len(S):
-    out_path = save_csv(S, OUT_CSV)
-    print(f"\nSaved recommendations table → {out_path}")
-    print(f"Plots → {PLOT_DIR}/")
-    print(f"\nVerdicts: {S['verdict'].value_counts().to_dict()}")
-    print("Tiers per window:  recommended_RR (safe, Phase 1) | aggressive_RR (more profit,"
-          " under cap) | unlocked_RR (Phase 2, cap ignored). UNLOCK_ONLY = seasoned-only.")
-    print("CAVEAT: caps EACH window alone; $2k is PER ACCOUNT and you stack ~2 windows/day"
-          " -> multi-account portfolio sim is the real per-account check (next step).")
+print("\nTiers per window: recommended_RR (safe, Phase 1) | aggressive_RR (more profit,"
+      " under cap) | unlocked_RR (Phase 2, cap ignored). UNLOCK_ONLY = seasoned-only.")
+print("CAVEAT: caps EACH window alone; $2k is PER ACCOUNT and you stack ~2 windows/day"
+      " -> multi-account portfolio sim is the real per-account check (next step).")
