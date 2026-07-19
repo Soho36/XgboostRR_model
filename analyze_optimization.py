@@ -42,6 +42,7 @@ REGIME_RR_TOL = 0.40        # |recommended_RR primary - reference| above this = 
 PLOT_DIR = "plots/optimization"
 OUT_CSV = "output_files/window_rr_recommendations.csv"
 MAX_DD_USD = 2000.0  # per-account prop drawdown ceiling in $ (at tester lot size)
+COMMISSION_PER_RT = 1.0  # $ commission per round-turn; MT5 opt was run WITHOUT costs
 MIN_TRADES = 100     # ignore passes with fewer trades (safety)
 MIN_RECOVERY = 2.0   # a window whose best pass earns < this x its own maxDD = WEAK
 SMOOTH_RR = 0.10     # half-width (in RR units) for plateau smoothing / neighborhood
@@ -78,10 +79,22 @@ def parse_mt5_xml(path):
     for c in ["profit", "pf", "recovery", "sharpe", "dd_pct", "trades", "rr", "exp_payoff", "result"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    # absolute $ drawdown = net profit / recovery factor (MT5's definition)
+    # absolute $ drawdown = GROSS profit / recovery factor (MT5's definition).
+    # Compute from gross figures BEFORE we net out commission.
     if "recovery" in df.columns:
         df["dd_usd"] = (df["profit"] / df["recovery"]).where(
             (df["recovery"] > 0) & (df["profit"] > 0))
+    # Apply commission (MT5 opt was run without costs). Trades is constant across
+    # RR in an isolated window, so this is a fixed $ haircut. profit -> NET; recovery
+    # recomputed on NET profit but keeping the tester's (gross) $ drawdown.
+    # NOTE: dd_usd stays GROSS — commission drag would raise the true DD somewhat,
+    # which we can't reconstruct from summary stats (re-run MT5 with commission for
+    # exact DD). Net profit is the part that flips a window from winner to loser.
+    if "trades" in df.columns and COMMISSION_PER_RT:
+        df["commission"] = df["trades"] * COMMISSION_PER_RT
+        df["profit_gross"] = df["profit"]
+        df["profit"] = df["profit"] - df["commission"]
+        df["recovery"] = (df["profit"] / df["dd_usd"]).where(df["dd_usd"] > 0)
     df = df.dropna(subset=["rr", "profit"]).sort_values("rr").reset_index(drop=True)
     # plateau smoothing: rolling mean over a +/- SMOOTH_RR neighbourhood, so an
     # isolated spike gets averaged down by its neighbours (robustness).
@@ -213,7 +226,8 @@ def process_dir(xml_dir, plot_dir, verbose=True):
         rec = recommend(df)
         png = plot_window(name, df, rec, plot_dir)
         row = {"window": name, "rr_lo": df["rr"].min(), "rr_hi": df["rr"].max(),
-               "trades": int(df["trades"].median())}
+               "trades": int(df["trades"].median()),
+               "commission$": round(int(df["trades"].median()) * COMMISSION_PER_RT)}
         for key, r in rec.items():
             if r is not None:
                 row[f"{key}_RR"] = round(float(r["rr"]), 2)
@@ -260,6 +274,15 @@ def save_csv(df, path):
         return alt
 
 
+def sort_by_hour(S):
+    """Order windows chronologically by start hour (2-3, 3-4, ... 22-23)."""
+    if not len(S):
+        return S
+    S = S.copy()
+    S["_h"] = S["window"].str.split("-").str[0].astype(int)
+    return S.sort_values("_h").drop(columns="_h").reset_index(drop=True)
+
+
 # ── RUN ONE STRATEGY (its own inputs -> its own recommendations CSV) ──────────
 def run_strategy(name, base_dir, plot_base, out_csv):
     primary_dir = os.path.join(base_dir, PRIMARY_SUBDIR)
@@ -278,8 +301,6 @@ def run_strategy(name, base_dir, plot_base, out_csv):
             S["regime"] = "n/a"
             S.loc[drr.notna() & (drr <= REGIME_RR_TOL), "regime"] = "stable"
             S.loc[drr.notna() & (drr > REGIME_RR_TOL), "regime"] = "SENSITIVE"
-            print("\n== Regime stability (primary vs reference recommended_RR) ==")
-            print(S[["window", "verdict", "recommended_RR", "ref_RR", "regime"]].to_string(index=False))
     else:
         if not glob.glob(os.path.join(base_dir, "*.xml")):
             print(f"  No XMLs in {base_dir}/ (or its {PRIMARY_SUBDIR}/ subfolder) — skipped.")
@@ -288,10 +309,16 @@ def run_strategy(name, base_dir, plot_base, out_csv):
               f"subfolders for regime comparison)")
         S = process_dir(base_dir, plot_base)
 
-    if len(S):
-        out_path = save_csv(S, out_csv)
-        print(f"\n[{name}] Saved recommendations → {out_path}   Plots → {plot_base}/")
-        print(f"[{name}] Verdicts: {S['verdict'].value_counts().to_dict()}")
+    if not len(S):
+        return
+    S = sort_by_hour(S)
+    if "regime" in S.columns:
+        print("\n== Regime stability (primary vs reference recommended_RR) ==")
+        print(S[["window", "verdict", "recommended_RR", "ref_RR", "regime"]].to_string(index=False))
+    out_path = save_csv(S, out_csv)
+    print(f"\n[{name}] Saved recommendations → {out_path}   Plots → {plot_base}/")
+    print(f"[{name}] Verdicts (net of ${COMMISSION_PER_RT:.0f}/RT commission): "
+          f"{S['verdict'].value_counts().to_dict()}")
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
