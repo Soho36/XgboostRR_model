@@ -38,10 +38,11 @@ import matplotlib.pyplot as plt
 matplotlib.use("Agg")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-MAEMFE_DIR = "MAEMFE"
+# One entry per strategy: name -> folder of per-window trade exports.
+STRATEGIES = {"RR": "RR_MAEMFE", "GG": "GG_MAEMFE"}
 PLOT_DIR = "plots/maemfe"
-OUT_SUMMARY = "output_files/maemfe_window_summary.csv"
-OUT_TRADES = "output_files/maemfe_combined_trades.csv"
+OUT_SUMMARY = "output_files/{s}_maemfe_window_summary.csv"
+OUT_TRADES = "output_files/{s}_maemfe_combined_trades.csv"
 COMMISSION_PER_RT = 1.0   # $ per round-turn
 COLS = ["ticket", "entry_time", "exit_time", "mae", "mfe", "profit", "candle_range"]
 
@@ -131,14 +132,30 @@ def summarise(df, label, rr=None):
     }
 
 
-# ── LOAD ──────────────────────────────────────────────────────────────────────
-paths = sorted(glob.glob(os.path.join(MAEMFE_DIR, "*.csv")))
-if not paths:
-    raise SystemExit(f"No CSVs in {MAEMFE_DIR}/")
+def save_csv(df, path):
+    try:
+        df.to_csv(path, index=False)
+        return path
+    except PermissionError:
+        import time
+        alt = path.replace(".csv", f"_{time.strftime('%H%M%S')}.csv")
+        df.to_csv(alt, index=False)
+        print(f"  ({path} locked — open in Excel? wrote {alt})")
+        return alt
 
-rows, frames = [], []
-print(f"Loading {len(paths)} window files from {MAEMFE_DIR}/ ...")
-for p in paths:
+
+# ── LOAD ──────────────────────────────────────────────────────────────────────
+def run_strategy(STRAT, MAEMFE_DIR):
+  plot_dir = os.path.join(PLOT_DIR, STRAT)
+  paths = sorted(glob.glob(os.path.join(MAEMFE_DIR, "*.csv")))
+  if not paths:
+    print(f"\n### {STRAT}: no CSVs in {MAEMFE_DIR}/ — skipped.")
+    return None
+
+  print(f"\n{'#' * 60}\n### STRATEGY {STRAT}  ({MAEMFE_DIR}/)\n{'#' * 60}")
+  rows, frames = [], []
+  print(f"Loading {len(paths)} window files from {MAEMFE_DIR}/ ...")
+  for p in paths:
     m = re.match(r"^(\d+-\d+)_([\d.]+)\.csv$", os.path.basename(p))
     if not m:
         print(f"  skip (name pattern): {os.path.basename(p)}")
@@ -152,109 +169,122 @@ for p in paths:
     frames.append(df)
     rows.append(summarise(df, win, rr))
 
-W = pd.DataFrame(rows)
-W["_h"] = W["window"].str.split("-").str[0].astype(int)
-W = W.sort_values("_h").drop(columns="_h").reset_index(drop=True)
+  W = pd.DataFrame(rows)
+  W["_h"] = W["window"].str.split("-").str[0].astype(int)
+  W = W.sort_values("_h").drop(columns="_h").reset_index(drop=True)
 
-# ── COMBINED PORTFOLIO (trades realised in exit-time order) ───────────────────
-ALL = pd.concat(frames, ignore_index=True).sort_values("exit_time").reset_index(drop=True)
-ALL["equity"] = ALL["net"].cumsum()
-peak = ALL["equity"].cummax()
-ALL["drawdown"] = ALL["equity"] - peak
-comb = summarise(ALL, "== COMBINED ==", None)
+  # ── COMBINED PORTFOLIO (trades realised in exit-time order) ─────────────────
+  ALL = pd.concat(frames, ignore_index=True).sort_values("exit_time").reset_index(drop=True)
+  ALL["strategy"] = STRAT
+  ALL["equity"] = ALL["net"].cumsum()
+  peak = ALL["equity"].cummax()
+  ALL["drawdown"] = ALL["equity"] - peak
+  comb = summarise(ALL, "== COMBINED ==", None)
 
-print("\n" + "=" * 118)
-print("PER-WINDOW RESULTS (net of $%.0f/round-turn commission)" % COMMISSION_PER_RT)
-print("=" * 118)
-show = ["window", "RR", "trades", "net_profit", "maxDD$", "maxDD_float$",
-        "recovery_float", "win%", "PF", "avg_trade", "maxLossStreak"]
-print(W[show].to_string(index=False))
+  print("\n" + "=" * 118)
+  print(f"[{STRAT}] PER-WINDOW RESULTS (net of ${COMMISSION_PER_RT:.0f}/round-turn commission)")
+  print("=" * 118)
+  show = ["window", "RR", "trades", "net_profit", "maxDD$", "maxDD_float$",
+          "recovery_float", "win%", "PF", "avg_trade", "maxLossStreak"]
+  print(W[show].to_string(index=False))
 
-print("\n" + "=" * 118)
-print("COMBINED PORTFOLIO  (all windows traded together, as in your multi-account setup)")
-print("=" * 118)
-for k in ["trades", "gross_profit", "commission", "net_profit", "maxDD$",
-          "maxDD_float$", "recovery", "recovery_float", "win%", "PF", "avg_trade",
-          "maxLossStreak", "first", "last"]:
-    print(f"  {k:<16} {comb[k]}")
-print(f"  {'sum of window':<16} {W['net_profit'].sum():.0f}  (equals combined net profit)")
-print(f"  {'sum of window DD':<16} {W['maxDD$'].sum():.0f}  <- if DDs all hit at once (worst case);"
-      f" actual combined DD is ${comb['maxDD$']:,} thanks to diversification")
+  print("\n" + "=" * 118)
+  print(f"[{STRAT}] COMBINED PORTFOLIO (all its windows together)")
+  print("=" * 118)
+  for k in ["trades", "gross_profit", "commission", "net_profit", "maxDD$",
+            "maxDD_float$", "recovery", "recovery_float", "win%", "PF", "avg_trade",
+            "maxLossStreak", "first", "last"]:
+      print(f"  {k:<16} {comb[k]}")
+  print(f"  {'sum of window DD':<16} {W['maxDD$'].sum():.0f}  <- if all DDs hit at once;"
+        f" actual combined DD ${comb['maxDD$']:,} (diversification)")
 
-# ── YEARLY BREAKDOWN ──────────────────────────────────────────────────────────
-ALL["year"] = ALL["exit_time"].dt.year
-yearly = ALL.groupby("year").agg(trades=("net", "size"), net=("net", "sum")).round(0)
-yearly["maxDD$"] = ALL.groupby("year")["net"].apply(lambda s: round(dd_stats(s)[0]))
-print("\n== Combined by year ==")
-print(yearly.to_string())
+  # ── YEARLY BREAKDOWN ────────────────────────────────────────────────────────
+  ALL["year"] = ALL["exit_time"].dt.year
+  yearly = ALL.groupby("year").agg(trades=("net", "size"), net=("net", "sum")).round(0)
+  yearly["maxDD$"] = ALL.groupby("year")["net"].apply(lambda s: round(dd_stats(s)[0]))
+  print(f"\n== [{STRAT}] combined by year ==")
+  print(yearly.to_string())
 
-# ── SAVE ──────────────────────────────────────────────────────────────────────
-os.makedirs("output_files", exist_ok=True)
+  # ── SAVE ────────────────────────────────────────────────────────────────────
+  os.makedirs("output_files", exist_ok=True)
+  out_all = pd.concat([W, pd.DataFrame([comb])], ignore_index=True)
+  p1 = save_csv(out_all, OUT_SUMMARY.format(s=STRAT))
+  p2 = save_csv(ALL[["strategy", "window", "RR", "entry_time", "exit_time", "mae",
+                     "mfe", "profit", "net", "equity", "drawdown"]],
+                OUT_TRADES.format(s=STRAT))
+
+  # ── PLOTS ───────────────────────────────────────────────────────────────────
+  os.makedirs(plot_dir, exist_ok=True)
+  fig, (a1, a2) = plt.subplots(2, 1, figsize=(13, 8), sharex=True,
+                               gridspec_kw={"height_ratios": [3, 1]})
+  a1.plot(ALL["exit_time"], ALL["equity"], color="tab:blue", lw=1.5)
+  a1.set_ylabel("Equity $ (net)")
+  a1.set_title(f"[{STRAT}] Combined — {len(frames)} windows, {comb['trades']} trades   "
+               f"net \\${comb['net_profit']:,.0f}   maxDD \\${comb['maxDD$']:,.0f}   "
+               f"recovery {comb['recovery']}")
+  a1.grid(alpha=0.25)
+  i_dd = ALL["drawdown"].idxmin()
+  a1.annotate(f"max DD \\${-ALL['drawdown'].min():,.0f}",
+              xy=(ALL["exit_time"][i_dd], ALL["equity"][i_dd]),
+              xytext=(10, -30), textcoords="offset points", fontsize=9,
+              arrowprops=dict(arrowstyle="->", color="tab:red"), color="tab:red")
+  a2.fill_between(ALL["exit_time"], ALL["drawdown"], 0, color="tab:red", alpha=0.4)
+  a2.set_ylabel("Drawdown $")
+  a2.set_xlabel("Date")
+  a2.grid(alpha=0.25)
+  fig.tight_layout()
+  fig.savefig(os.path.join(plot_dir, "combined_equity.png"), dpi=110)
+  plt.close(fig)
+
+  n = len(frames)
+  ncol, nrow = 3, int(np.ceil(n / 3))
+  fig, axes = plt.subplots(nrow, ncol, figsize=(15, 3.0 * nrow), sharex=True,
+                           squeeze=False)
+  order = sorted(frames, key=lambda d: int(d["window"].iloc[0].split("-")[0]))
+  for ax, fr in zip(np.ravel(axes), order):
+      s = fr.sort_values("exit_time")
+      eq = s["net"].cumsum()
+      w, rr = s["window"].iloc[0], s["RR"].iloc[0]
+      mdd = dd_stats(s["net"])[0]
+      ax.plot(s["exit_time"], eq, lw=1.3,
+              color="tab:green" if eq.iloc[-1] > 0 else "tab:red")
+      ax.axhline(0, color="grey", lw=0.7)
+      ax.set_title(f"{w} @ RR {rr}   net \\${eq.iloc[-1]:,.0f}  DD \\${mdd:,.0f}", fontsize=9)
+      ax.grid(alpha=0.2)
+  for ax in np.ravel(axes)[n:]:
+      ax.axis("off")
+  fig.suptitle(f"[{STRAT}] per-window equity curves (net of commission)", y=1.0)
+  fig.tight_layout()
+  fig.savefig(os.path.join(plot_dir, "per_window_equity.png"), dpi=110)
+  plt.close(fig)
+
+  print(f"\nSaved: {p1}\n       {p2}\nPlots: {plot_dir}/")
+  return W, ALL, comb
 
 
-def save_csv(df, path):
-    try:
-        df.to_csv(path, index=False)
-        return path
-    except PermissionError:
-        import time
-        alt = path.replace(".csv", f"_{time.strftime('%H%M%S')}.csv")
-        df.to_csv(alt, index=False)
-        print(f"  ({path} locked — open in Excel? wrote {alt})")
-        return alt
+# ── MAIN: run every strategy, then a cross-strategy view ──────────────────────
+results = {}
+for STRAT, DIRNAME in STRATEGIES.items():
+    r = run_strategy(STRAT, DIRNAME)
+    if r is not None:
+        results[STRAT] = r
 
+if len(results) > 1:
+    print("\n" + "#" * 118)
+    print("CROSS-STRATEGY VIEW (every window of every strategy traded together)")
+    print("#" * 118)
+    BOTH = pd.concat([r[1] for r in results.values()], ignore_index=True)
+    BOTH = BOTH.sort_values("exit_time").reset_index(drop=True)
+    BOTH["equity"] = BOTH["net"].cumsum()
+    cb = summarise(BOTH, "== RR+GG ==", None)
+    for k in ["trades", "net_profit", "maxDD$", "recovery", "win%", "PF", "avg_trade"]:
+        print(f"  {k:<14} {cb[k]}")
+    per = {s: r[2] for s, r in results.items()}
+    print("\n  strategy      net_profit   maxDD$   recovery")
+    for s, c in per.items():
+        print(f"  {s:<12} {c['net_profit']:>10}  {c['maxDD$']:>7}   {c['recovery']}")
+    print(f"  {'SUM of DDs':<12} {'':>10}  {sum(c['maxDD$'] for c in per.values()):>7}"
+          f"   <- vs combined ${cb['maxDD$']:,}  (cross-strategy diversification)")
 
-out_all = pd.concat([W, pd.DataFrame([comb])], ignore_index=True)
-p1 = save_csv(out_all, OUT_SUMMARY)
-p2 = save_csv(ALL[["window", "RR", "entry_time", "exit_time", "mae", "mfe",
-                   "profit", "net", "equity", "drawdown"]], OUT_TRADES)
-
-# ── PLOTS ─────────────────────────────────────────────────────────────────────
-os.makedirs(PLOT_DIR, exist_ok=True)
-
-fig, (a1, a2) = plt.subplots(2, 1, figsize=(13, 8), sharex=True,
-                             gridspec_kw={"height_ratios": [3, 1]})
-a1.plot(ALL["exit_time"], ALL["equity"], color="tab:blue", lw=1.5)
-a1.set_ylabel("Equity $ (net)")
-a1.set_title(f"Combined portfolio — {len(frames)} windows, {comb['trades']} trades   "
-             f"net \${comb['net_profit']:,.0f}   maxDD \${comb['maxDD$']:,.0f}   "
-             f"recovery {comb['recovery']}")
-a1.grid(alpha=0.25)
-i_dd = ALL["drawdown"].idxmin()
-a1.annotate(f"max DD \${-ALL['drawdown'].min():,.0f}",
-            xy=(ALL["exit_time"][i_dd], ALL["equity"][i_dd]),
-            xytext=(10, -30), textcoords="offset points", fontsize=9,
-            arrowprops=dict(arrowstyle="->", color="tab:red"), color="tab:red")
-a2.fill_between(ALL["exit_time"], ALL["drawdown"], 0, color="tab:red", alpha=0.4)
-a2.set_ylabel("Drawdown $")
-a2.set_xlabel("Date")
-a2.grid(alpha=0.25)
-fig.tight_layout()
-fig.savefig(os.path.join(PLOT_DIR, "combined_equity.png"), dpi=110)
-plt.close(fig)
-
-n = len(frames)
-ncol, nrow = 3, int(np.ceil(n / 3))
-fig, axes = plt.subplots(nrow, ncol, figsize=(15, 3.0 * nrow), sharex=True)
-for ax, fr in zip(np.ravel(axes), sorted(frames, key=lambda d: int(d["window"].iloc[0].split("-")[0]))):
-    s = fr.sort_values("exit_time")
-    eq = s["net"].cumsum()
-    w, rr = s["window"].iloc[0], s["RR"].iloc[0]
-    mdd = dd_stats(s["net"])[0]
-    ax.plot(s["exit_time"], eq, lw=1.3,
-            color="tab:green" if eq.iloc[-1] > 0 else "tab:red")
-    ax.axhline(0, color="grey", lw=0.7)
-    ax.set_title(f"{w} @ RR {rr}   net \${eq.iloc[-1]:,.0f}  DD \${mdd:,.0f}", fontsize=9)
-    ax.grid(alpha=0.2)
-for ax in np.ravel(axes)[n:]:
-    ax.axis("off")
-fig.suptitle("Per-window equity curves (net of commission)", y=1.0)
-fig.tight_layout()
-fig.savefig(os.path.join(PLOT_DIR, "per_window_equity.png"), dpi=110)
-plt.close(fig)
-
-print(f"\nSaved: {p1}")
-print(f"       {p2}")
-print(f"Plots: {PLOT_DIR}/combined_equity.png , {PLOT_DIR}/per_window_equity.png")
-print("\nNOTE: combined = windows run independently (your multi-account setup). A SINGLE")
-print("account running all windows would hit position-slot blocking and do worse.")
+print("\nNOTE: combined = windows run independently (multi-account setup). One account")
+print("running everything would hit position-slot blocking and do worse.")

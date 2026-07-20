@@ -18,6 +18,18 @@ random local search.
 INPUT : output_files/maemfe_combined_trades.csv  (from analyze_maemfe.py)
 OUTPUT: output_files/account_allocation.csv
         plots/allocation/account_equity.png      (if matplotlib is available)
+
+=================
+Mechanics:
+1. Load every trade (from maemfe_combined_trades.csv): which window it belongs to, its net P/L, its mae.
+2. GROUP_METRICS — for each possible group of 1 or 2 windows, pull just those windows' trades, put them in time order, and measure that group's max drawdown. This is precomputed for every candidate pairing.
+3. solve_exact_assignment (the DP) — hands account 1 some windows, account 2 some of what's left, and so on, trying every legal way, and keeps the arrangement whose worst account (drawdown ÷ its own limit) is lowest. The dp(account_idx, remaining_mask) memoization just avoids re-solving the same "these accounts left, these windows left" situation twice.
+4. Score three approaches on the same yardstick — worst account's % of its limit:
+    Optimised fixed (the DP answer)
+    3,000 random fixed assignments
+    300 daily-reshuffle simulations
+4. Output the assignment table + the equity/DD plot.
+=================
 """
 
 from functools import lru_cache
@@ -41,6 +53,15 @@ TRADES_CSV = "output_files/maemfe_combined_trades.csv"
 PLOT_DIR = "plots/allocation"
 OUT_CSV = "output_files/account_allocation.csv"
 
+ACCOUNT_NAMES = [
+    "PA-08-1500",
+    "PA-09-1500",
+    "PA-10-1500",
+    "PA-11-1500",
+    "PA-12-2000",
+    "PA-13-2000",
+    "PA-14-2000",
+]
 ACCOUNT_LIMITS = [1500.0] * 4 + [2000.0] * 3
 MIN_WINDOWS_PER_ACCOUNT = 1
 MAX_WINDOWS_PER_ACCOUNT = 2
@@ -72,6 +93,10 @@ date_code, DATES = pd.factorize(T[SHUFFLE_ASSIGN_ON].dt.date)
 
 NW, NA = len(WINDOWS), len(ACCOUNT_LIMITS)
 LIMITS = np.array(ACCOUNT_LIMITS, dtype=float)
+if len(ACCOUNT_NAMES) != NA:
+    raise SystemExit(
+        f"ACCOUNT_NAMES has {len(ACCOUNT_NAMES)} entries but ACCOUNT_LIMITS has {NA}."
+    )
 
 if DD_MODE not in {"closed", "floating"}:
     raise SystemExit("DD_MODE must be 'closed' or 'floating'.")
@@ -139,7 +164,7 @@ def mask_to_windows(mask):
 
 
 def window_mask_size(mask):
-    return int(mask.bit_count())
+    return bin(mask).count("1")  # int.bit_count() needs Python 3.10+
 
 
 def account_group_metrics(mask):
@@ -276,7 +301,7 @@ for account_idx, mask in enumerate(best_masks):
     ratio = dds[account_idx] / LIMITS[account_idx]
     rows.append(
         {
-            "account": f"A{account_idx + 1}",
+            "account": ACCOUNT_NAMES[account_idx],
             "DD_limit": int(LIMITS[account_idx]),
             "windows": ", ".join(wins),
             "net_profit": round(profits[account_idx]),
@@ -385,7 +410,7 @@ else:
             np.cumsum(net[trade_mask]),
             lw=1.3,
             label=(
-                f"A{account_idx + 1} (${int(LIMITS[account_idx])}) "
+                f"{ACCOUNT_NAMES[account_idx]} (${int(LIMITS[account_idx])}) "
                 f"DD ${dds[account_idx]:,.0f}"
             ),
         )
@@ -404,7 +429,7 @@ else:
         ],
     )
     ax2.plot(x, LIMITS, "r_", markersize=28, markeredgewidth=2.5, label="DD limit")
-    ax2.set_xticks(x, [f"A{i + 1}" for i in x])
+    ax2.set_xticks(x, ACCOUNT_NAMES, rotation=35, ha="right")
     ax2.set_title("Max drawdown vs limit")
     ax2.set_ylabel("$")
     ax2.legend()
@@ -418,3 +443,26 @@ print("\nNOTE: drawdowns are historical (2020-2026). Future DD can exceed them,"
 print(f"which is why the target is <= {SAFETY_TARGET * 100:.0f}% of the limit, not 99%.")
 if DD_MODE == "floating":
     print("Floating DD uses trade MAE as an approximation; tick-level open equity would be better.")
+
+
+"""
+Why the shuffle loses — and why fixed isn't "removing diversification"
+This is the heart of it, and your intuition has one wrong assumption. Here's the corrected picture:
+
+Diversification is already 100% baked into the 12 windows and it never changes. All 12 together always make $63,452 with a $3,348 combined drawdown — no matter how you hand them out. You cannot add or remove that by assignment. So the assignment question is not "how much diversification" — it's "where does the fixed pile of drawdown land, and can each account hold its share?"
+
+Analogy — 12 rocks, 7 shelves with weight limits. You must place all 12 rocks (total weight fixed). Each shelf can break at its limit (1500 or 2000).
+
+Fixed optimised = you deliberately place heavy rocks on strong shelves and balance the rest. Best possible: worst shelf at 83%.
+Random fixed = you place them once, blindfolded. Worst shelf typically at 143% — something broke.
+Daily shuffle = every single day you re-toss all rocks onto random shelves. Over years, each shelf eventually catches a bad pile-up. Worst shelf ends at 171% — worse than doing it randomly once, because you keep re-rolling and every shelf gets many chances to be overloaded.
+Measured: 83% (optimised) < 143% (random once) < 171% (shuffle) — 100% of shuffles blew an account.
+
+Why shuffling can't help: your limit binds on the worst of 7 accounts. Random placement gives you no control over the worst one — you're taking the max of 7 noisy outcomes, and the max of noise is bad. Deliberate placement controls all 7 at once.
+
+And there's a bonus fixed gives you that shuffle can't: you can permanently pair windows whose bad patches happen at different times, so they cancel. Proof from your own data — account A3:
+
+5-6 alone drops $956, 7-8 alone drops $716. Put them on the same account permanently → combined drawdown $698 — less than 7-8 by itself. Their drawdowns offset.
+
+That's real diversification working at the account level — and you only capture it by keeping the pair together. Shuffle scatters them, so no account ever gets a clean offsetting pair. Fixed assignment doesn't remove diversification; it places it where it protects each account.
+"""
