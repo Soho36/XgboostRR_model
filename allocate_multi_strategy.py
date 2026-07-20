@@ -3,33 +3,34 @@ allocate_multi_strategy.py
 ==========================
 Pick WHICH windows to trade (from RR + GG) and WHICH account each goes to.
 
-Why this differs from allocate_accounts.py: there we had 12 windows and 12+ slots,
-so every window was traded and total profit was constant -> pure risk-shuffling.
-Now we have 19 candidate windows (12 RR + 7 GG) but only 7 accounts x 2 = 14
-slots, so we must SELECT. Profit is no longer constant, so the objective becomes:
+Why this differs from allocate_accounts.py: there we had 12 windows and 12+
+slots, so every window was traded and total profit was constant. Now we have
+more candidate windows than account slots, so profit is no longer constant:
 
-    maximise total net profit
-    subject to  every account's drawdown <= (cap fraction) x its own DD limit
+    maximize total net profit
+    subject to every account's drawdown <= cap_fraction * available DD
 
-CONSTRAINT — strategy-pure accounts: an account runs ONE script, and the broker
-account is NETTING, so two scripts on one account would produce conflicting
-orders. Therefore, every window on a given account must come from the same
-strategy. (Day-alternating between strategies is possible in principle but each
-window would then only trade ~half the days, losing profit, so it is not modelled.)
-
-Solved EXACTLY with scipy.optimize.milp (integer program), not a heuristic.
+Candidate account groups are scored with an account-level one-position replay
+by default. That means if a 2-3 trade is still open when a 3-4 signal arrives,
+the later entry is skipped before profit and drawdown are measured.
 
 INPUT : output_files/RR_maemfe_combined_trades.csv
         output_files/GG_maemfe_combined_trades.csv   (from analyze_maemfe.py)
 OUTPUT: output_files/multi_strategy_allocation.csv
 """
 
+from functools import lru_cache
 import itertools
 import os
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import milp, LinearConstraint, Bounds
+
+try:
+    from scipy.optimize import Bounds, LinearConstraint, milp
+except ImportError:
+    Bounds = LinearConstraint = milp = None
+
 
 # ---- CONFIG -----------------------------------------------------------------
 TRADE_FILES = {
@@ -38,28 +39,65 @@ TRADE_FILES = {
 }
 OUT_CSV = "output_files/multi_strategy_allocation.csv"
 
+ACCOUNT_NAMES = [
+    "PA-08-1500",
+    "PA-09-1500",
+    "PA-10-1500",
+    "PA-11-1500",
+    "PA-12-2000",
+    "PA-13-2000",
+    "PA-14-2000",
+]
 ACCOUNT_LIMITS = [1500.0] * 4 + [2000.0] * 3
+
+# Override this when an account has already used some trailing DD. The cap
+# frontier is applied to this available amount, not blindly to the nominal limit.
+ACCOUNT_DD_AVAILABLE = ACCOUNT_LIMITS.copy()
+
 MAX_WINDOWS_PER_ACCOUNT = 2
-# Fraction of each account's limit the historical DD may use. Lower = more
-# future headroom but less profit. We solve the whole frontier.
+
+# Keep this False while one broker account can safely run only one strategy EA.
+# If you later build one unified RR+GG controller, switch it to True and compare.
+ALLOW_MIXED_STRATEGIES = False
+
+# True = simulate one open position per account group, skipping entries that
+# arrive before the previous accepted trade closes.
+REPLAY_ONE_POSITION = True
+
+# Optional hard operational rule. Leave False if blocked entries are acceptable
+# and you want the optimizer to price them in; set True to disallow 2-3 + 3-4.
+FORBID_ADJACENT_WINDOWS = False
+
+# Fraction of each account's available DD the historical DD may use. Lower =
+# more future headroom but less profit. We solve the whole frontier.
 CAP_FRACTIONS = [1.00, 0.90, 0.85, 0.80, 0.70]
-REPORT_FRACTION = 0.85          # which one to print in full / save
+REPORT_FRACTION = 0.85
+
 
 NA = len(ACCOUNT_LIMITS)
-LIMITS = np.array(ACCOUNT_LIMITS)
+if len(ACCOUNT_NAMES) != NA:
+    raise SystemExit(
+        f"ACCOUNT_NAMES has {len(ACCOUNT_NAMES)} entries but ACCOUNT_LIMITS has {NA}."
+    )
+if len(ACCOUNT_DD_AVAILABLE) != NA:
+    raise SystemExit(
+        "ACCOUNT_DD_AVAILABLE must have one entry for each ACCOUNT_LIMITS entry."
+    )
+
+LIMITS = np.array(ACCOUNT_LIMITS, dtype=float)
+AVAILABLE_DD = np.array(ACCOUNT_DD_AVAILABLE, dtype=float)
 
 
 # ---- LOAD -------------------------------------------------------------------
 frames = []
 for strat, path in TRADE_FILES.items():
     if not os.path.exists(path):
-        raise SystemExit(f"Missing {path} — run analyze_maemfe.py first.")
+        raise SystemExit(f"Missing {path} - run analyze_maemfe.py first.")
     d = pd.read_csv(path, parse_dates=["entry_time", "exit_time"])
     d["strategy"] = strat
     frames.append(d)
 T = pd.concat(frames, ignore_index=True).sort_values("exit_time").reset_index(drop=True)
 
-# candidate windows keyed by (strategy, window)
 KEYS = sorted(
     T.groupby(["strategy", "window"]).groups.keys(),
     key=lambda k: (k[0], int(k[1].split("-")[0])),
@@ -68,136 +106,302 @@ NW = len(KEYS)
 K_IDX = {k: i for i, k in enumerate(KEYS)}
 T["kidx"] = list(zip(T["strategy"], T["window"]))
 T["kidx"] = T["kidx"].map(K_IDX)
-kidx = T["kidx"].to_numpy()
-net = T["net"].to_numpy(float)
-mae = T["mae"].to_numpy(float)
 RR_OF = {K_IDX[k]: T.loc[T["kidx"] == K_IDX[k], "RR"].iloc[0] for k in KEYS}
 
-print(f"{len(T)} trades | {NW} candidate windows "
-      f"({sum(1 for k in KEYS if k[0]=='RR')} RR + {sum(1 for k in KEYS if k[0]=='GG')} GG)"
-      f" | {NA} accounts, {NA*MAX_WINDOWS_PER_ACCOUNT} slots")
+print(
+    f"{len(T)} trades | {NW} candidate windows "
+    f"({sum(1 for k in KEYS if k[0] == 'RR')} RR + "
+    f"{sum(1 for k in KEYS if k[0] == 'GG')} GG) "
+    f"| {NA} accounts, {NA * MAX_WINDOWS_PER_ACCOUNT} slots"
+)
+print(
+    f"Group scoring: {'one-position replay' if REPLAY_ONE_POSITION else 'isolated add-up'}"
+)
+print(
+    f"Strategy mixing: {'allowed' if ALLOW_MIXED_STRATEGIES else 'disabled'}"
+)
+print(f"Adjacent-hour pairs: {'forbidden' if FORBID_ADJACENT_WINDOWS else 'allowed'}")
+print(f"Solver: {'scipy.optimize.milp' if milp is not None else 'exact DP fallback'}")
 
 
-def dd_floating(order):
+# ---- GROUP METRICS ----------------------------------------------------------
+def max_dd_floating(df):
     """Max DD including open floating loss (MAE), trades in exit-time order."""
     equity = peak = maxdd = 0.0
-    for n, m in zip(net[order], mae[order]):
-        maxdd = max(maxdd, peak - (equity + min(m, 0.0)))
-        equity += n
+    for row in df.sort_values("exit_time").itertuples(index=False):
+        maxdd = max(maxdd, peak - (equity + min(float(row.mae), 0.0)))
+        equity += float(row.net)
         peak = max(peak, equity)
         maxdd = max(maxdd, peak - equity)
-    return maxdd
+    return float(maxdd)
 
 
-# ---- CANDIDATE GROUPS (1-2 windows, SAME strategy) --------------------------
-groups = []          # (tuple_of_window_idx, dd, profit, strategy)
-by_strategy = {}
-for i, (s, w) in enumerate(KEYS):
-    by_strategy.setdefault(s, []).append(i)
+def replay_one_position(df):
+    """Keep the first signal while flat; skip later signals until that trade exits."""
+    accepted_idx = []
+    open_until = pd.Timestamp.min
+    ordered = df.sort_values(["entry_time", "exit_time", "strategy", "window"])
+    for idx, row in ordered.iterrows():
+        if row["entry_time"] >= open_until:
+            accepted_idx.append(idx)
+            open_until = row["exit_time"]
+    return df.loc[accepted_idx].copy()
 
-for s, idxs in by_strategy.items():
-    for size in range(1, MAX_WINDOWS_PER_ACCOUNT + 1):
-        for combo in itertools.combinations(idxs, size):
-            sel = np.isin(kidx, combo)          # already in exit_time order
-            order = np.flatnonzero(sel)
-            groups.append((combo, dd_floating(order), float(net[order].sum()), s))
 
-print(f"{len(groups)} candidate groups (1-2 windows, strategy-pure)")
+def combo_mask(combo):
+    return sum(1 << i for i in combo)
+
+
+def combo_strategy(combo):
+    strategies = sorted({KEYS[i][0] for i in combo})
+    return strategies[0] if len(strategies) == 1 else "MIXED"
+
+
+def has_adjacent_hours(combo):
+    hours = sorted(int(KEYS[i][1].split("-")[0]) for i in combo)
+    return any(b - a == 1 for a, b in zip(hours, hours[1:]))
+
+
+def combo_trade_frame(combo):
+    return T[T["kidx"].isin(combo)].copy()
+
+
+def combo_metrics(combo):
+    isolated = combo_trade_frame(combo)
+    effective = replay_one_position(isolated) if REPLAY_ONE_POSITION else isolated
+    return {
+        "combo": tuple(combo),
+        "mask": combo_mask(combo),
+        "strategy": combo_strategy(combo),
+        "profit": float(effective["net"].sum()),
+        "dd": max_dd_floating(effective),
+        "trades": int(len(effective)),
+        "blocked_trades": int(len(isolated) - len(effective)),
+        "isolated_profit": float(isolated["net"].sum()),
+        "isolated_dd": max_dd_floating(isolated),
+    }
+
+
+def candidate_pools():
+    if ALLOW_MIXED_STRATEGIES:
+        return [list(range(NW))]
+    by_strategy = {}
+    for i, (strategy, _window) in enumerate(KEYS):
+        by_strategy.setdefault(strategy, []).append(i)
+    return list(by_strategy.values())
+
+
+groups = []
+for pool in candidate_pools():
+    max_size = min(MAX_WINDOWS_PER_ACCOUNT, len(pool))
+    for size in range(1, max_size + 1):
+        for combo in itertools.combinations(pool, size):
+            if FORBID_ADJACENT_WINDOWS and has_adjacent_hours(combo):
+                continue
+            groups.append(combo_metrics(combo))
+
+print(
+    f"{len(groups)} candidate groups "
+    f"(1-{MAX_WINDOWS_PER_ACCOUNT} windows"
+    f"{'' if ALLOW_MIXED_STRATEGIES else ', strategy-pure'})"
+)
+
+
+# ---- EXACT SOLVERS ----------------------------------------------------------
+def solve_with_milp(cap_fraction):
+    """Exact ILP: max profit s.t. each account <= cap_fraction * available DD."""
+    caps = AVAILABLE_DD * cap_fraction
+    var = [
+        (gi, account_idx)
+        for gi, group in enumerate(groups)
+        for account_idx in range(NA)
+        if group["dd"] <= caps[account_idx]
+    ]
+    if not var:
+        return None
+
+    n = len(var)
+    c = np.array([-groups[gi]["profit"] for gi, _account_idx in var])
+
+    rows, lb, ub = [], [], []
+    for account_idx in range(NA):
+        r = np.array([1.0 if a == account_idx else 0.0 for _gi, a in var])
+        rows.append(r)
+        lb.append(1)
+        ub.append(1)
+
+    for window_idx in range(NW):
+        bit = 1 << window_idx
+        r = np.array([1.0 if groups[gi]["mask"] & bit else 0.0 for gi, _a in var])
+        rows.append(r)
+        lb.append(0)
+        ub.append(1)
+
+    res = milp(
+        c=c,
+        constraints=LinearConstraint(np.array(rows), lb, ub),
+        integrality=np.ones(n),
+        bounds=Bounds(0, 1),
+    )
+    if not res.success:
+        return None
+    return [var[i] for i in np.flatnonzero(res.x > 0.5)]
+
+
+def solve_with_dp(cap_fraction):
+    """Exact fallback solver for environments without scipy."""
+    caps = AVAILABLE_DD * cap_fraction
+
+    @lru_cache(maxsize=None)
+    def dp(account_idx, used_mask):
+        if account_idx == NA:
+            return 0.0, ()
+
+        remaining_accounts = NA - account_idx
+        unused_windows = NW - bin(used_mask).count("1")
+        if unused_windows < remaining_accounts:
+            return -np.inf, None
+
+        best_profit, best_choice = -np.inf, None
+        for gi, group in enumerate(groups):
+            if group["mask"] & used_mask:
+                continue
+            if group["dd"] > caps[account_idx]:
+                continue
+            child_profit, child_choice = dp(account_idx + 1, used_mask | group["mask"])
+            if child_choice is None:
+                continue
+            profit = group["profit"] + child_profit
+            if profit > best_profit:
+                best_profit = profit
+                best_choice = ((gi, account_idx),) + child_choice
+        return best_profit, best_choice
+
+    _profit, choice = dp(0, 0)
+    return list(choice) if choice is not None else None
 
 
 def solve(cap_fraction):
-    """Exact ILP: max profit s.t. each account <= cap_fraction * its limit."""
-    caps = LIMITS * cap_fraction
-    # variables x[g, a] only where the group fits that account
-    var = [(gi, a) for gi, g in enumerate(groups) for a in range(NA) if g[1] <= caps[a]]
-    if not var:
-        return None
-    n = len(var)
-    c = np.array([-groups[gi][2] for gi, _ in var])          # maximise profit
-
-    rows, lb, ub = [], [], []
-    # each account gets exactly one group
-    for a in range(NA):
-        r = np.array([1.0 if aa == a else 0.0 for _, aa in var])
-        rows.append(r); lb.append(1); ub.append(1)
-    # each window used at most once
-    for w in range(NW):
-        r = np.array([1.0 if w in groups[gi][0] else 0.0 for gi, _ in var])
-        rows.append(r); lb.append(0); ub.append(1)
-
-    res = milp(c=c, constraints=LinearConstraint(np.array(rows), lb, ub),
-               integrality=np.ones(n), bounds=Bounds(0, 1))
-    if not res.success:
-        return None
-    chosen = [var[i] for i in np.flatnonzero(np.round(res.x) == 1)]
-    return chosen
+    if milp is not None:
+        return solve_with_milp(cap_fraction)
+    return solve_with_dp(cap_fraction)
 
 
-def describe(chosen, cap_fraction):
+# ---- REPORTING --------------------------------------------------------------
+def format_window(window_idx, include_strategy):
+    strategy, window = KEYS[window_idx]
+    prefix = f"{strategy} " if include_strategy else ""
+    return f"{prefix}{window}@{RR_OF[window_idx]:g}"
+
+
+def describe(chosen):
     rows, used = [], set()
-    for gi, a in sorted(chosen, key=lambda t: t[1]):
-        combo, dd, profit, s = groups[gi]
+    for gi, account_idx in sorted(chosen, key=lambda t: t[1]):
+        group = groups[gi]
+        combo = group["combo"]
         used.update(combo)
-        wins = [f"{KEYS[i][1]}@{RR_OF[i]:g}" for i in combo]
-        hours = sorted(int(KEYS[i][1].split("-")[0]) for i in combo)
-        adjacent = len(hours) == 2 and hours[1] - hours[0] == 1
-        rows.append({
-            "account": f"A{a+1}", "DD_limit": int(LIMITS[a]), "strategy": s,
-            "windows": ", ".join(wins), "net_profit": round(profit),
-            "maxDD": round(dd), "used_%_of_limit": round(dd / LIMITS[a] * 100, 1),
-            "headroom": round(LIMITS[a] - dd),
-            "adjacent_hours": "yes" if adjacent else "",
-        })
+        include_strategy = group["strategy"] == "MIXED"
+        wins = [format_window(i, include_strategy) for i in combo]
+        adjacent = has_adjacent_hours(combo)
+        rows.append(
+            {
+                "account": ACCOUNT_NAMES[account_idx],
+                "DD_limit": int(LIMITS[account_idx]),
+                "DD_available": int(AVAILABLE_DD[account_idx]),
+                "strategy": group["strategy"],
+                "windows": ", ".join(wins),
+                "net_profit": round(group["profit"]),
+                "maxDD": round(group["dd"]),
+                "used_%_of_available": round(
+                    group["dd"] / AVAILABLE_DD[account_idx] * 100, 1
+                ),
+                "used_%_of_limit": round(group["dd"] / LIMITS[account_idx] * 100, 1),
+                "headroom_available": round(AVAILABLE_DD[account_idx] - group["dd"]),
+                "trades": group["trades"],
+                "blocked_trades": group["blocked_trades"],
+                "adjacent_hours": "yes" if adjacent else "",
+            }
+        )
     return pd.DataFrame(rows), used
 
 
-# ---- FRONTIER ---------------------------------------------------------------
-print("\n" + "=" * 96)
-print("PROFIT vs SAFETY FRONTIER  (exact optimum at each cap)")
-print("=" * 96)
-print(f"{'cap':>6}  {'$1500->':>8} {'$2000->':>8}  {'total net profit':>17}  {'windows used':>13}")
-frontier = {}
-for f in CAP_FRACTIONS:
-    ch = solve(f)
-    if ch is None:
-        print(f"{f*100:5.0f}%  {'':>8} {'':>8}  {'INFEASIBLE':>17}")
-        continue
-    df, used = describe(ch, f)
-    frontier[f] = (ch, df, used)
-    print(f"{f*100:5.0f}%  {1500*f:>8.0f} {2000*f:>8.0f}  "
-          f"{df['net_profit'].sum():>17,.0f}  {len(used):>10}/{NW}")
+def single_window_metrics(window_idx):
+    return combo_metrics((window_idx,))
 
-# ---- DETAIL AT THE REPORTING CAP --------------------------------------------
+
+# ---- FRONTIER ---------------------------------------------------------------
+print("\n" + "=" * 110)
+print("PROFIT vs SAFETY FRONTIER  (exact optimum at each cap)")
+print("=" * 110)
+print(
+    f"{'cap':>6}  {'total net profit':>17}  {'windows used':>13}  "
+    f"{'blocked':>8}  {'worst avail use':>15}"
+)
+frontier = {}
+for fraction in CAP_FRACTIONS:
+    chosen = solve(fraction)
+    if chosen is None:
+        print(f"{fraction * 100:5.0f}%  {'INFEASIBLE':>17}")
+        continue
+    df, used = describe(chosen)
+    frontier[fraction] = (chosen, df, used)
+    print(
+        f"{fraction * 100:5.0f}%  {df['net_profit'].sum():>17,.0f}  "
+        f"{len(used):>10}/{NW:<2}  {df['blocked_trades'].sum():>8,.0f}  "
+        f"{df['used_%_of_available'].max():>14.1f}%"
+    )
+
+
+# ---- DETAIL AT THE REPORTING CAP -------------------------------------------
+if not frontier:
+    raise SystemExit("No feasible allocation found at any configured cap fraction.")
 if REPORT_FRACTION not in frontier:
     REPORT_FRACTION = max(frontier)
+
 chosen, A, used = frontier[REPORT_FRACTION]
-print("\n" + "=" * 96)
-print(f"ALLOCATION AT {REPORT_FRACTION*100:.0f}% CAP")
-print("=" * 96)
+print("\n" + "=" * 110)
+print(f"ALLOCATION AT {REPORT_FRACTION * 100:.0f}% CAP")
+print("=" * 110)
 print(A.to_string(index=False))
-print(f"\nTotal net profit: ${A['net_profit'].sum():,.0f}   "
-      f"worst account at {A['used_%_of_limit'].max():.1f}% of its limit")
+print(
+    f"\nTotal net profit: ${A['net_profit'].sum():,.0f}   "
+    f"worst account at {A['used_%_of_available'].max():.1f}% of available DD"
+)
 
 dropped = [KEYS[i] for i in range(NW) if i not in used]
 print(f"\nDropped windows ({len(dropped)}):")
-for s, w in dropped:
-    i = K_IDX[(s, w)]
-    sel = np.flatnonzero(kidx == i)
-    print(f"   {s} {w:<6} RR {RR_OF[i]:<5g} net ${net[sel].sum():>7,.0f}  "
-          f"DD ${dd_floating(sel):>6,.0f}")
+for strategy, window in dropped:
+    window_idx = K_IDX[(strategy, window)]
+    m = single_window_metrics(window_idx)
+    print(
+        f"   {strategy} {window:<6} RR {RR_OF[window_idx]:<5g} "
+        f"net ${m['profit']:>7,.0f}  DD ${m['dd']:>6,.0f}"
+    )
 
+if REPLAY_ONE_POSITION:
+    blocked = int(A["blocked_trades"].sum())
+    print(
+        f"\nReplay note: candidate groups were scored after skipping blocked entries "
+        f"({blocked:,} skipped trades in the reported allocation)."
+    )
 if (A["adjacent_hours"] == "yes").any():
-    print("\nNOTE: accounts flagged 'adjacent_hours' pair back-to-back hours; one EA holds")
-    print("one position, so a trade running long can block the next window's entry.")
-    print("Our per-window data was recorded in isolation, so that effect is not modelled.")
+    print(
+        "Adjacent-hour pairs remain flagged for operations, but their blocking "
+        "impact is now included in profit/DD scoring."
+    )
 
 os.makedirs("output_files", exist_ok=True)
 try:
     A.to_csv(OUT_CSV, index=False)
+    print(f"\nSaved {OUT_CSV}")
 except PermissionError:
     import time
+
     OUT_CSV = OUT_CSV.replace(".csv", f"_{time.strftime('%H%M%S')}.csv")
-    A.to_csv(OUT_CSV, index=False)
-print(f"\nSaved {OUT_CSV}")
-print("\nEach account is strategy-pure (one script, netting-safe). Add accounts by")
-print("extending ACCOUNT_LIMITS — the optimiser will pull in the dropped windows.")
+    try:
+        A.to_csv(OUT_CSV, index=False)
+        print(f"\nSaved {OUT_CSV}")
+    except PermissionError:
+        print(f"\nCould not save {OUT_CSV}: permission denied or file locked.")
+print("\nEach account is strategy-pure unless ALLOW_MIXED_STRATEGIES=True.")
+print("Add accounts by extending ACCOUNT_NAMES, ACCOUNT_LIMITS, and ACCOUNT_DD_AVAILABLE.")
