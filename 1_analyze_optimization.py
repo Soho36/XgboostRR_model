@@ -28,7 +28,7 @@ import pandas as pd
 matplotlib.use("Agg")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-XML_DIR = "data_1_optimization"
+XML_DIR = "INPUTS/data_1_optimization_input"
 # Each strategy is its own subfolder of XML_DIR with its own inputs and output CSV.
 # RR = enter after last RED candle; GG = enter after last GREEN candle.
 # Add more strategy names here and drop a matching subfolder of XMLs to include them.
@@ -39,7 +39,7 @@ STRATEGIES = ["RR", "GG"]
 PRIMARY_SUBDIR = "recent"   # e.g. 2020-2026 optimizations  (the market you trade)
 REF_SUBDIR = "full"         # e.g. 2010-2026 optimizations  (calm-market reference)
 REGIME_RR_TOL = 0.40        # |recommended_RR primary - reference| above this = regime-sensitive
-PLOT_DIR = "plots/step1_optimization"
+PLOT_DIR = "OUTPUTS/plots_outputs/step1_optimization"
 OUT_CSV = "results/window_rr_recommendations.csv"
 MAX_DD_USD = 2000.0  # per-account prop drawdown ceiling in $ (at tester lot size)
 COMMISSION_PER_RT = 1.0  # $ commission per round-turn; MT5 opt was run WITHOUT costs
@@ -322,7 +322,7 @@ def run_strategy(name, base_dir, plot_base, out_csv):
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
-os.makedirs("results", exist_ok=True)
+os.makedirs("OUTPUTS/results_outputs", exist_ok=True)
 strat_dirs = [s for s in STRATEGIES
               if os.path.isdir(os.path.join(XML_DIR, s))
               and (glob.glob(os.path.join(XML_DIR, s, "*.xml"))
@@ -332,7 +332,7 @@ if strat_dirs:
     for name in strat_dirs:
         run_strategy(name, os.path.join(XML_DIR, name),
                      os.path.join(PLOT_DIR, name),
-                     os.path.join("results", f"{name}_recommendations.csv"))
+                     os.path.join("OUTPUTS/results_outputs", f"{name}_recommendations.csv"))
 else:
     # backward-compat: no strategy subfolders yet -> treat flat XML_DIR as one strategy
     print(f"No strategy subfolders {STRATEGIES} found under {XML_DIR}/ — "

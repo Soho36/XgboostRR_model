@@ -390,7 +390,7 @@ if (A["adjacent_hours"] == "yes").any():
         "impact is now included in profit/DD scoring."
     )
 
-os.makedirs("results", exist_ok=True)
+os.makedirs("OUTPUTS/results_outputs", exist_ok=True)
 try:
     A.to_csv(OUT_CSV, index=False)
     print(f"\nSaved {OUT_CSV}")

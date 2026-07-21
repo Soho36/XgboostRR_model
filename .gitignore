@@ -2,11 +2,11 @@
 /.idea/
 /__pycache__/
 /legacy_regime_data/
-/results/
-/plots/
-/data_1_optimization/
+/OUTPUTS/results_outputs/
+/OUTPUTS/plots_outputs/
+/INPUTS/data_1_optimization_input/
 rr_model.json
 feature_importance.csv
 /archive/
-/data_2_maemfe/
+/INPUTS/data_2_maemfe_input/
 /strategy_ea_example.cs
