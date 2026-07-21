@@ -39,10 +39,10 @@ matplotlib.use("Agg")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 # One entry per strategy: name -> folder of per-window trade exports.
-STRATEGIES = {"RR": "RR_MAEMFE", "GG": "GG_MAEMFE"}
-PLOT_DIR = "plots/maemfe"
-OUT_SUMMARY = "output_files/{s}_maemfe_window_summary.csv"
-OUT_TRADES = "output_files/{s}_maemfe_combined_trades.csv"
+STRATEGIES = {"RR": "data_2_maemfe/RR", "GG": "data_2_maemfe/GG"}
+PLOT_DIR = "plots/step2_portfolio"
+OUT_SUMMARY = "results/{s}_maemfe_window_summary.csv"
+OUT_TRADES = "results/{s}_maemfe_combined_trades.csv"
 COMMISSION_PER_RT = 1.0   # $ per round-turn
 COLS = ["ticket", "entry_time", "exit_time", "mae", "mfe", "profit", "candle_range"]
 
@@ -206,7 +206,7 @@ def run_strategy(STRAT, MAEMFE_DIR):
   print(yearly.to_string())
 
   # ── SAVE ────────────────────────────────────────────────────────────────────
-  os.makedirs("output_files", exist_ok=True)
+  os.makedirs("results", exist_ok=True)
   out_all = pd.concat([W, pd.DataFrame([comb])], ignore_index=True)
   p1 = save_csv(out_all, OUT_SUMMARY.format(s=STRAT))
   p2 = save_csv(ALL[["strategy", "window", "RR", "entry_time", "exit_time", "mae",
