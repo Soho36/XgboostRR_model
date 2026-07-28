@@ -66,11 +66,23 @@ blocked entries.
 - **out:** `OUTPUTS/results_outputs/multi_strategy_allocation.csv`
 
 ### Step 4 — `4_build_report.py` (interactive report)
-Aggregates every result into **one self-contained interactive HTML** — tabs per
-step, sortable tables, hover/toggle equity curves. No dependencies, offline.
+Aggregates every result into **one self-contained interactive HTML** (Plotly
+inlined — offline, no CDN). Tabs per step, sortable tables, zoomable charts.
+
+The per-trade data is shipped into the page and **every chart on the Portfolio
+tab recomputes from the windows you tick** — including the drawdown subplot, so
+the DD shown is always the DD of exactly that selection. Equity and drawdown
+share an x-axis (zoom one, both zoom).
+
+Portfolio tab charts: equity + drawdown subplot · monthly PnL · yearly PnL ·
+monthly heatmap (year × month) · PnL by entry hour · by weekday · by month of
+year (seasonality) · per-trade PnL histogram.
+
+Chart controls: drag to zoom · double-click to reset · modebar for
+pan / box-zoom / save-png.
 
 - **in:**  everything in `OUTPUTS/results_outputs/`
-- **out:** `OUTPUTS/report.html`  (open in any browser)
+- **out:** `OUTPUTS/report.html`  (~5 MB, open in any browser)
 
 ## Folder map
 
