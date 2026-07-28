@@ -370,7 +370,7 @@ function redraw(){
  Plotly.react('c_equity',traces,{
    margin:{l:66,r:16,t:34,b:34},font:FONT,hovermode:'x unified',dragmode:'zoom',
    title:{text:'Equity & drawdown of the selected windows',x:0,font:{size:13}},
-   xaxis:{domain:[0,1],anchor:'y2',showgrid:true,gridcolor:'#eef0f3'},
+   xaxis:{domain:[0,1],anchor:'y2',showgrid:true,gridcolor:'#eef0f3',type:'date'},
    yaxis:{domain:[.34,1],title:'equity $',gridcolor:'#eef0f3',zeroline:false},
    yaxis2:{domain:[0,.26],title:'DD $',gridcolor:'#eef0f3'},
    legend:{orientation:'h',y:-.12,font:{size:10}},
@@ -452,7 +452,7 @@ function drawAccounts(){
  Plotly.react('c_accounts',tr,{margin:{l:66,r:16,t:34,b:34},font:FONT,
    title:{text:'Per-account equity (one-position replay)',x:0,font:{size:13}},
    hovermode:'x unified',dragmode:'zoom',
-   xaxis:{gridcolor:'#eef0f3'},yaxis:{title:'equity $',gridcolor:'#eef0f3'},
+   xaxis:{gridcolor:'#eef0f3',type:'date'},yaxis:{title:'equity $',gridcolor:'#eef0f3'},
    legend:{orientation:'h',y:-.14,font:{size:10}},
    plot_bgcolor:'#fff',paper_bgcolor:'#fff'},CFG);
 }
