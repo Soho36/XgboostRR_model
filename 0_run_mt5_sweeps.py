@@ -24,6 +24,10 @@ USAGE
   python 0_run_mt5_sweeps.py --windows 11-12 --dry-run   # print the .ini only
   python 0_run_mt5_sweeps.py --windows 11-12 --strategy GG
   python 0_run_mt5_sweeps.py --windows 2-3 3-4 4-5 --strategy GG
+  python 0_run_mt5_sweeps.py --windows 11-12 --strategy RR --rr 1.0 2.0 0.1
+  python 0_run_mt5_sweeps.py --windows all --strategy RR --rr 1.0 2.0 0.1
+  python 0_run_mt5_sweeps.py --windows 1-2 2-3 3-4 4-5 5-6 6-7 7-8 8-9 9-10 10-11 11-12 12-13 13-14 14-15 15-16 16-17 17-18 18-19 19-20 20-21 21-22 22-23 23-24 --strategy RR --rr 0.5 3.0 0.1
+  python 0_run_mt5_sweeps.py --windows 1-2 2-3 3-4 4-5 5-6 6-7 7-8 8-9 9-10 10-11 11-12 12-13 13-14 14-15 15-16 16-17 17-18 18-19 19-20 20-21 21-22 22-23 23-24 --strategy GG --rr 0.5 3.0 0.1
 """
 
 import argparse
@@ -31,7 +35,7 @@ import json
 import os
 import shutil
 import subprocess
-import sys
+# import sys
 import time
 
 # ---- CONFIG: set these once -------------------------------------------------
@@ -91,6 +95,7 @@ def inputs_for_window(win):
         "1-2": ["W0100W0130", "W0130W0200"],   # EA splits 01:00-02:00 in halves
         "23-0": ["W2300W2330", "W2330W0000"],
         "23-24": ["W2300W2330", "W2330W0000"],
+        "all": ALL_WINDOW_INPUTS,
     }
     if win in special:
         return special[win]

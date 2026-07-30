@@ -2,16 +2,9 @@
 /.idea/
 /__pycache__/
 /legacy_regime_data/
-/OUTPUTS/results_outputs/
-/OUTPUTS/plots_outputs/
 /INPUTS/legacy_optimization_xml/
 rr_model.json
 feature_importance.csv
 /archive/
-/INPUTS/data_2_maemfe_input/
 /strategy_ea_example.cs
-/OUTPUTS/report.html
 /PROJECT_NOTES_FOR_REVIEW.md
-/GG_r_MFE_buy-stop-entry(example).cs
-/RR_r_MFE_buy-stop-entry(example).cs
-/OUTPUTS/mt5_ini/
