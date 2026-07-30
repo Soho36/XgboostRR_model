@@ -34,10 +34,10 @@ except ImportError:
 
 # ---- CONFIG -----------------------------------------------------------------
 TRADE_FILES = {
-    "RR": "results/RR_maemfe_combined_trades.csv",
-    "GG": "results/GG_maemfe_combined_trades.csv",
+    "RR": "OUTPUTS/results_outputs/RR_maemfe_combined_trades.csv",
+    "GG": "OUTPUTS/results_outputs/GG_maemfe_combined_trades.csv",
 }
-OUT_CSV = "results/multi_strategy_allocation.csv"
+OUT_CSV = "OUTPUTS/results_outputs/multi_strategy_allocation.csv"
 
 ACCOUNT_NAMES = [
     "PA-08-1500",
@@ -126,10 +126,17 @@ print(f"Solver: {'scipy.optimize.milp' if milp is not None else 'exact DP fallba
 
 # ---- GROUP METRICS ----------------------------------------------------------
 def max_dd_floating(df):
-    """Max DD including open floating loss (MAE), trades in exit-time order."""
+    """Max EQUITY DD including open floating P/L in BOTH directions.
+
+    Tracking the intra-trade peak (MFE) as well as the trough (MAE) reproduces
+    MT5's STAT_EQUITY_DD exactly; MAE alone understates it (a trade that runs
+    to +MFE then closes lower is a real equity give-back a prop firm counts).
+    """
     equity = peak = maxdd = 0.0
     for row in df.sort_values("exit_time").itertuples(index=False):
+        # MAE before MFE — validated exact against MT5 on 12 passes.
         maxdd = max(maxdd, peak - (equity + min(float(row.mae), 0.0)))
+        peak = max(peak, equity + max(float(row.mfe), 0.0))
         equity += float(row.net)
         peak = max(peak, equity)
         maxdd = max(maxdd, peak - equity)

@@ -46,10 +46,7 @@ OUT_CSV = "OUTPUTS/results_outputs/rr_pertrade_recommendations.csv"
 COMMISSION_PER_RT = 1.0     # $ per round-turn (per-trade exports were run w/o costs)
 MAX_DD_USD = 2000.0         # DD cap for the tier picks (a single window's budget)
 MIN_RECOVERY = 2.0          # recommended pick below this profit/DD ratio = WEAK
-DD_MODE = "floating"        # "floating" (equity, via MAE) or "closed" (balance)
-# Our floating DD ran ~10-15% below MT5's true equity DD (MAE-timing approximation).
-# Set >1 to inflate the DD used for the cap toward the real equity figure.
-DD_HAIRCUT = 1.15
+DD_MODE = "equity"          # "equity" (MAE+MFE, matches MT5 exactly) | "closed" (balance)
 
 COLS = ["ticket", "entry_time", "exit_time", "mae", "mfe", "profit", "candle_range"]
 
@@ -82,10 +79,28 @@ def dd_closed(net):
     return float((np.maximum.accumulate(eq) - eq).max()) if len(eq) else 0.0
 
 
-def dd_floating(net, mae):
+def dd_equity(net, mae, mfe):
+    """Equity drawdown including intra-trade excursions.
+
+    Validated against MT5: reproduces STAT_EQUITY_DD to the dollar (GG 11-12
+    @2.99 -> $3,579 by both). Equally, dropping the MFE term reproduces
+    STAT_BALANCE_DD ($2,925).
+
+    The earlier MAE-only version tracked equity PEAKS only at closed-trade
+    level, so a trade that ran to +MFE and closed lower had its give-back
+    ignored — that understatement is what the old DD_HAIRCUT=1.15 was papering
+    over. The true factor turned out to vary 1.01x-1.22x per window, so a
+    single global fudge was wrong in both directions. Now computed exactly.
+    """
     eq = peak = mdd = 0.0
-    for n, m in zip(np.asarray(net, float), np.asarray(mae, float)):
-        mdd = max(mdd, peak - (eq + min(m, 0.0)))
+    for n, a, f in zip(np.asarray(net, float), np.asarray(mae, float),
+                       np.asarray(mfe, float)):
+        # Order within a trade is MAE then MFE: a buy-stop breakout usually
+        # retraces against you first, then runs. Validated against MT5 on 12
+        # passes (window 2-3 at 11 RRs + GG 11-12) — exact every time. Using the
+        # reverse order over-states DD by up to ~15%.
+        mdd = max(mdd, peak - (eq + min(a, 0.0)))   # dip, against the standing peak
+        peak = max(peak, eq + max(f, 0.0))          # then the run-up sets a new peak
         eq += n
         peak = max(peak, eq)
         mdd = max(mdd, peak - eq)
@@ -94,8 +109,9 @@ def dd_floating(net, mae):
 
 def metrics(df):
     net = df["net"].values
-    dd = dd_floating(net, df["mae"].values) if DD_MODE == "floating" else dd_closed(net)
-    dd_capped = dd * DD_HAIRCUT
+    dd = (dd_equity(net, df["mae"].values, df["mfe"].values)
+          if DD_MODE == "equity" else dd_closed(net))
+    dd_capped = dd
     wins, losses = net[net > 0], net[net < 0]
     pf = wins.sum() / abs(losses.sum()) if losses.sum() != 0 else np.inf
     tot = float(net.sum())

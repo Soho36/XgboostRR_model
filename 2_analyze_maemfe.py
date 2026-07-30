@@ -39,10 +39,11 @@ matplotlib.use("Agg")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 # One entry per strategy: name -> folder of per-window trade exports.
-STRATEGIES = {"RR": "data_2_maemfe/RR", "GG": "data_2_maemfe/GG"}
+STRATEGIES = {"RR": "INPUTS/data_2_maemfe_input/RR",
+              "GG": "INPUTS/data_2_maemfe_input/GG"}
 PLOT_DIR = "OUTPUTS/plots_outputs/step2_portfolio"
-OUT_SUMMARY = "results/{s}_maemfe_window_summary.csv"
-OUT_TRADES = "results/{s}_maemfe_combined_trades.csv"
+OUT_SUMMARY = "OUTPUTS/results_outputs/{s}_maemfe_window_summary.csv"
+OUT_TRADES = "OUTPUTS/results_outputs/{s}_maemfe_combined_trades.csv"
 COMMISSION_PER_RT = 1.0   # $ per round-turn
 COLS = ["ticket", "entry_time", "exit_time", "mae", "mfe", "profit", "candle_range"]
 
@@ -85,18 +86,24 @@ def dd_stats(net_series):
     return maxdd, rec, dd
 
 
-def dd_floating(net_series, mae_series):
-    """Max drawdown including OPEN floating P/L, using each trade's MAE.
+def dd_floating(net_series, mae_series, mfe_series):
+    """Max EQUITY drawdown, including intra-trade excursions in both directions.
 
-    Closed-trade DD understates what a prop firm measures: during a trade the
-    equity dips to (equity_before + MAE) before the trade closes. This walks the
-    trades and tracks the worst peak-to-trough including those intra-trade dips.
+    Closed-trade DD understates what a prop firm measures: while a trade is open
+    the equity swings out to +MFE and down to +MAE. Tracking BOTH reproduces
+    MT5's STAT_EQUITY_DD exactly (verified on GG 11-12 @2.99: $3,579 by this
+    and by MT5); using MAE alone gave $3,081, and dropping both gives the
+    balance DD ($2,925 — also an exact match).
+
     Assumes one position at a time (true per window; approximate when combined).
     """
     eq = peak = maxdd = 0.0
-    for n, m in zip(np.asarray(net_series, float), np.asarray(mae_series, float)):
-        trough = eq + min(m, 0.0)              # worst point while the trade is open
-        maxdd = max(maxdd, peak - trough)
+    for n, m, f in zip(np.asarray(net_series, float), np.asarray(mae_series, float),
+                       np.asarray(mfe_series, float)):
+        # MAE happens before MFE: a buy-stop breakout typically retraces first,
+        # then runs. Validated exact against MT5 on 12 passes.
+        maxdd = max(maxdd, peak - (eq + min(m, 0.0)))   # dip vs the standing peak
+        peak = max(peak, eq + max(f, 0.0))              # then the run-up
         eq += n
         peak = max(peak, eq)
         maxdd = max(maxdd, peak - eq)
@@ -106,7 +113,7 @@ def dd_floating(net_series, mae_series):
 def summarise(df, label, rr=None):
     net = df["net"].values
     maxdd, rec, _ = dd_stats(net)
-    maxdd_f = dd_floating(net, df["mae"].values)
+    maxdd_f = dd_floating(net, df["mae"].values, df["mfe"].values)
     wins, losses = net[net > 0], net[net < 0]
     pf = wins.sum() / abs(losses.sum()) if losses.sum() != 0 else np.inf
     # max consecutive losses

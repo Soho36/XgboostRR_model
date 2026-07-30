@@ -34,14 +34,22 @@ import sys
 import time
 
 # ---- CONFIG: set these once -------------------------------------------------
-TERMINAL_EXE = r"I:\Programs\1AMP Global (USA) MT5 Exchange-Traded Futures Only\terminal64.exe"
-# One compiled EA per strategy. Paths are relative to MQL5\Experts\ in the MT5
-# DATA folder (File > Open Data Folder), and must be the .ex5, not the source.
-EA_PATHS = {
-    "RR": r"RR_r_MFE_buy-stop-entry.ex5",
-    "GG": r"GG_r_MFE_buy-stop-entry(example).ex5",
+# Each strategy has its OWN MT5 installation here, so terminal/expert/symbol are
+# all per-strategy. "expert" is relative to MQL5\Experts\ in that terminal's DATA
+# folder (File > Open Data Folder) and must be the compiled .ex5, INCLUDING any
+# subfolder — a bare filename fails with "tester didn't start / EX5 not found".
+STRATEGIES = {
+    "RR": {
+        "terminal": r"I:\Programs\1AMP Global (USA) MT5 Exchange-Traded Futures Only\terminal64.exe",
+        "expert": r"444\RR_r_MFE_buy-stop-entry.ex5",
+        "symbol": "MNQcontDATABENTOcurr6",
+    },
+    "GG": {
+        "terminal": r"I:\Programs\1MetaTrader 5\terminal64.exe",
+        "expert": r"555\GG_r_MFE_buy-stop-entry.ex5",
+        "symbol": "MNQcontDATABENTOcurr6",
+    },
 }
-SYMBOL = "MNQcontDATABENTOcurr6"
 PERIOD = "M30"
 DEPOSIT = 5000
 CURRENCY = "USD"
@@ -93,13 +101,64 @@ def inputs_for_window(win):
     return [name]
 
 
+def data_dir_for(terminal_exe):
+    """Map terminal64.exe -> its %APPDATA%\\MetaQuotes\\Terminal\\<hash> data folder."""
+    root = os.path.join(os.environ.get("APPDATA", ""), "MetaQuotes", "Terminal")
+    want = os.path.dirname(os.path.abspath(terminal_exe)).lower()
+    if not os.path.isdir(root):
+        return None
+    for name in os.listdir(root):
+        origin = os.path.join(root, name, "origin.txt")
+        if not os.path.isfile(origin):
+            continue
+        try:
+            with open(origin, "rb") as fh:
+                txt = fh.read().decode("utf-16", errors="ignore").strip("﻿\x00 \r\n")
+        except OSError:
+            continue
+        if txt.lower() == want:
+            return os.path.join(root, name)
+    return None
+
+
+def preflight(strategy):
+    """Fail loudly BEFORE launching. A wrong Expert path makes MT5 exit in ~8s
+    with no output at all, which is near-impossible to diagnose from outside."""
+    cfg = STRATEGIES[strategy]
+    problems = []
+    if not os.path.isfile(cfg["terminal"]):
+        problems.append(f"terminal not found: {cfg['terminal']}")
+        return problems
+    dd = data_dir_for(cfg["terminal"])
+    if dd is None:
+        print(f"  (note: could not resolve data folder for {strategy}; "
+              f"skipping the Expert existence check)")
+        return problems
+    ex5 = os.path.join(dd, "MQL5", "Experts", cfg["expert"].replace("\\", os.sep))
+    if not os.path.isfile(ex5):
+        found = []
+        base = os.path.basename(cfg["expert"])
+        for r, _d, fs in os.walk(os.path.join(dd, "MQL5", "Experts")):
+            for f in fs:
+                if f.lower() == base.lower():
+                    rel = os.path.relpath(os.path.join(r, f),
+                                          os.path.join(dd, "MQL5", "Experts"))
+                    found.append(rel)
+        msg = f"Expert not found: MQL5\\Experts\\{cfg['expert']}"
+        if found:
+            msg += "\n      did you mean:  " + "\n                     ".join(found)
+        problems.append(msg)
+    return problems
+
+
 def build_ini(win, tag, strategy, rr):
     on = set(inputs_for_window(win))
     rr_start, rr_stop, rr_step = rr
+    cfg = STRATEGIES[strategy]
     lines = [
         "[Tester]",
-        f"Expert={EA_PATHS[strategy]}",
-        f"Symbol={SYMBOL}",
+        f"Expert={cfg['expert']}",
+        f"Symbol={cfg['symbol']}",
         f"Period={PERIOD}",
         f"Model={MODEL}",
         f"FromDate={FROM_DATE}",
@@ -123,25 +182,35 @@ def build_ini(win, tag, strategy, rr):
     return "\n".join(lines) + "\n"
 
 
-def collect(tag, dest_dir):
-    """Move <tag>_*.csv out of the MT5 Common\\Files folder into the project."""
+def collect(tag, dest_dir, stats_dir):
+    """Move <tag>_*.csv out of MT5's Common\\Files into the project.
+
+    Per-trade files go to dest_dir; the EA's OnTester summaries (*_stats.csv)
+    go to stats_dir so they don't confuse the per-trade globs downstream.
+    """
     if not os.path.isdir(COMMON_FILES):
         print(f"  ! Common folder not found: {COMMON_FILES}")
-        return 0
+        return 0, 0
     os.makedirs(dest_dir, exist_ok=True)
-    n = 0
+    os.makedirs(stats_dir, exist_ok=True)
+    n_tr = n_st = 0
     for f in os.listdir(COMMON_FILES):
-        if f.startswith(tag + "_") and f.lower().endswith(".csv"):
+        if not (f.startswith(tag + "_") and f.lower().endswith(".csv")):
+            continue
+        if f.lower().endswith("_stats.csv"):
+            shutil.move(os.path.join(COMMON_FILES, f), os.path.join(stats_dir, f))
+            n_st += 1
+        else:
             shutil.move(os.path.join(COMMON_FILES, f), os.path.join(dest_dir, f))
-            n += 1
-    return n
+            n_tr += 1
+    return n_tr, n_st
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--windows", nargs="+", help="e.g. 11-12 9-10 2-3")
-    ap.add_argument("--strategy", default="RR", choices=sorted(EA_PATHS),
-                    help="which EA to run; also picks the <STRAT>_sweeps folder")
+    ap.add_argument("--strategy", default="RR", choices=sorted(STRATEGIES),
+                    help="which EA/terminal to run; also picks the <STRAT>_sweeps folder")
     ap.add_argument("--rr", nargs=3, type=float, metavar=("START", "STOP", "STEP"),
                     default=[RR_START, RR_STOP, RR_STEP],
                     help=f"RR sweep, default {RR_START} {RR_STOP} {RR_STEP}")
@@ -160,17 +229,24 @@ def main():
     if not a.windows:
         ap.error("give --windows (or --list)")
 
+    cfg = STRATEGIES[a.strategy]
     n_rr = int(round((rr_stop - rr_start) / rr_step)) + 1
-    print(f"strategy {a.strategy} ({EA_PATHS[a.strategy]})\n"
+    print(f"strategy {a.strategy}\n"
+          f"  terminal {cfg['terminal']}\n"
+          f"  expert   {cfg['expert']}   symbol {cfg['symbol']}\n"
           f"{len(a.windows)} window(s) x {n_rr} RR values "
           f"({rr_start}..{rr_stop} step {rr_step}) "
           f"= {len(a.windows) * n_rr} backtests\n"
           f"period {FROM_DATE}..{TO_DATE}  model={MODEL}  "
           f"{'COMPLETE sweep' if OPTIMIZATION_MODE == 1 else 'GENETIC (skips values!)'}")
 
-    if not a.dry_run and not os.path.isfile(TERMINAL_EXE):
-        raise SystemExit(f"terminal64.exe not found at {TERMINAL_EXE}\n"
-                         "Edit TERMINAL_EXE at the top of this script.")
+    if not a.dry_run:
+        problems = preflight(a.strategy)
+        if problems:
+            raise SystemExit("Preflight failed for strategy %s:\n    %s\n"
+                             "Fix STRATEGIES[%r] at the top of this script."
+                             % (a.strategy, "\n    ".join(problems), a.strategy))
+        print("  preflight OK (terminal + expert found)")
 
     os.makedirs(INI_DIR, exist_ok=True)
     for win in a.windows:
@@ -182,18 +258,28 @@ def main():
         if a.dry_run:
             print(f"\n----- {ini} -----\n{build_ini(win, tag, a.strategy, rr)}")
             print(f"expected files: {tag}_{rr_start:.2f}.csv .. {tag}_{rr_stop:.2f}.csv "
-                  f"({n_rr} of them) in\n  {COMMON_FILES}")
+                  f"({n_rr} of them, plus *_stats.csv) in\n  {COMMON_FILES}")
             continue
 
+        # <STRAT>_sweeps/<window>/ is what 1b_rr_from_maemfe.py globs for.
+        # (INPUTS/data_2_maemfe_input/<STRAT>/ is the separate, hand-picked set
+        # of one-RR-per-window files that step 2 consumes.)
         dest = os.path.join(DEST_ROOT, f"{a.strategy}_sweeps", win)
+        stats = os.path.join(DEST_ROOT, f"{a.strategy}_sweeps_stats", win)
         print(f"\n[{win}] launching MT5 ...")
         t0 = time.time()
-        subprocess.run([TERMINAL_EXE, f"/config:{os.path.abspath(ini)}"], check=False)
-        got = collect(tag, dest)
-        print(f"[{win}] done in {time.time()-t0:,.0f}s — collected {got} CSVs -> {dest}")
-        if got == 0:
-            print("      ! nothing collected. Check that the EA patch is applied "
-                  "(RunTag + FILE_COMMON) and that RunTag matched the window label.")
+        subprocess.run([cfg["terminal"], f"/config:{os.path.abspath(ini)}"], check=False)
+        n_tr, n_st = collect(tag, dest, stats)
+        print(f"[{win}] done in {time.time()-t0:,.0f}s — {n_tr} trade CSVs -> {dest}"
+              f"   |   {n_st} stats -> {stats}")
+        if n_tr == 0:
+            dd = data_dir_for(cfg["terminal"])
+            print("      ! nothing collected. Most likely causes:")
+            print("        - symbol not available in that terminal")
+            print("        - date range has no data")
+            print("        - EA patch (RunTag + FILE_COMMON) not compiled in")
+            if dd:
+                print(f"      check the MT5 log: {os.path.join(dd, 'logs')}")
 
     if not a.dry_run:
         print("\nNext:  venv/Scripts/python.exe 1b_rr_from_maemfe.py")
