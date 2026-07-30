@@ -13,119 +13,129 @@ prop accounts. Two variants are analysed:
 ## Pipeline (run in order)
 
 ```
- MT5 optimization XMLs            MT5 per-trade exports           prop accounts
- (RR sweep per window)            (chosen window @ RR)            (unequal DD limits)
-        │                                 │                             │
-        ▼                                 ▼                             ▼
- 1_analyze_optimization.py  ──►  2_analyze_maemfe.py  ──────►  3_allocate_accounts.py
-   pick DD-aware RR per window     real equity curves,           choose which windows to
-   (recommended/aggressive/        combined portfolio,           trade + which account each
-    unlocked tiers)                per-window & per-year          goes to (exact ILP, max
-        │                                                         profit under DD limits)
-        ▼                                                               │
- 1b_rr_from_maemfe.py  (ground truth)                                   ▼
-   re-check an RR pick from real                              4_build_report.py
-   per-trade exports at a small                                 one interactive HTML
-   RR grid — no XML staleness                                   report of everything
+ 0_run_mt5_sweeps.py   drives MT5: one optimization per window, sweeping RR
+        │              -> per-trade CSVs + per-pass _stats.csv
+        ▼
+ 1_select_rr.py        DD-aware RR pick per window, from REAL per-trade data
+        │              -> recommended / aggressive / unlocked tiers
+        ▼
+ 2_analyze_maemfe.py   equity curves, drawdowns, combined portfolio
+        │
+        ▼
+ 3_allocate_accounts.py  exact ILP: which windows on which prop account
+        │
+        ▼
+ 4_build_report.py     one interactive HTML report of everything
 ```
 
-### Step 1 — `1_analyze_optimization.py`
-For each window, reads an MT5 RiskReward optimization sweep and picks a
-drawdown-aware RR (best Recovery Factor whose $ drawdown stays under the cap),
-plus a plateau/robustness check and a recent-vs-full regime-stability flag.
+Everything downstream of step 0 reads **per-trade data only**. The old
+optimization-XML path is retired (see *Legacy* below) — it was a summary-only
+source that drifted from the per-trade exports in period and tester settings,
+which caused repeated drawdown discrepancies.
 
-- **in:**  `INPUTS/data_1_optimization_input/<RR|GG>/<recent|full>/<from>-<till>.xml`
-- **out:** `OUTPUTS/results_outputs/<RR|GG>_recommendations.csv`,
-           `OUTPUTS/plots_outputs/step1_optimization/<RR|GG>/`
+### Step 0 — `0_run_mt5_sweeps.py`
+Launches MT5 headlessly per window (config `.ini` + `ShutdownTerminal=1`) and
+collects the exports. The RR sweep is done *by* MT5's optimizer (one pass per RR
+value); this script loops the **windows**.
 
-### Step 1b — `1b_rr_from_maemfe.py` (per-trade RR check)
-Same tier logic as step 1 but computed from **real per-trade exports** at a
-small RR grid — the ground-truth check when the XMLs may be stale (period or
-tester-settings mismatch). Use it for any window whose DD recently changed.
+Each strategy has its own MT5 install, so `STRATEGIES` holds a per-strategy
+`terminal` / `expert` / `symbol`. A `preflight()` verifies the terminal and the
+compiled `.ex5` exist before launching — without it a wrong Expert path makes
+MT5 exit in ~8s with no output at all.
 
-- **in:**  `INPUTS/data_2_maemfe_input/<STRAT>_sweeps/<window>/<window>_<RR>.csv`
+- **out:** `INPUTS/data_2_maemfe_input/<STRAT>_sweeps/<window>/<window>_<RR>.csv`
+           `INPUTS/data_2_maemfe_input/<STRAT>_sweeps_stats/<window>/..._stats.csv`
+           plus a `_manifest.json` per window recording symbol/dates/model
+
+```bash
+venv/Scripts/python.exe 0_run_mt5_sweeps.py --windows 2-3 3-4 --strategy RR --rr 1.0 2.0 0.1
+venv/Scripts/python.exe 0_run_mt5_sweeps.py --list        # window -> EA input mapping
+```
+
+### Step 1 — `1_select_rr.py`
+Per-window RR tiers (`recommended` / `aggressive` / `unlocked`) computed from
+the real per-trade sweeps, with the DD cap applied to the **equity** drawdown.
+
+- **in:**  `INPUTS/data_2_maemfe_input/<STRAT>_sweeps/<window>/`
 - **out:** `OUTPUTS/results_outputs/rr_pertrade_recommendations.csv`,
-           `OUTPUTS/plots_outputs/step1b_rr_pertrade/`
+           `OUTPUTS/plots_outputs/step1_rr_selection/`
 
 ### Step 2 — `2_analyze_maemfe.py`
-Reads per-trade exports for the **chosen** window+RR set and builds real
-equity curves, drawdowns, and the combined portfolio (+ a cross-strategy view).
+Takes the **chosen** window+RR files and builds real equity curves, drawdowns,
+per-year breakdowns and the combined portfolio (plus a cross-strategy view).
 
-- **in:**  `INPUTS/data_2_maemfe_input/<RR|GG>/<from>-<till>_<RR>.csv`  (UTF-16, tab, no header)
+- **in:**  `INPUTS/data_2_maemfe_input/<RR|GG>/<window>_<RR>.csv`
+           (one file per window — copy the winners out of the sweep folders)
 - **out:** `OUTPUTS/results_outputs/<RR|GG>_maemfe_window_summary.csv`,
            `OUTPUTS/results_outputs/<RR|GG>_maemfe_combined_trades.csv`,
-           `OUTPUTS/plots_outputs/step2_portfolio/<RR|GG>/`
+           `OUTPUTS/plots_outputs/step2_portfolio/`
 
 ### Step 3 — `3_allocate_accounts.py`
-Exact integer program: pick which windows to trade and which account each goes
-to, **maximising net profit** subject to every account staying under its DD
-limit. Accounts are strategy-pure (netting-safe); one-position replay prices in
-blocked entries.
+Exact integer program (`scipy.optimize.milp`): pick which windows to trade and
+which account each goes to, maximising net profit subject to every account's DD
+limit. Accounts are strategy-pure (netting-safe); a one-position replay prices
+in blocked entries.
 
 - **in:**  `OUTPUTS/results_outputs/<RR|GG>_maemfe_combined_trades.csv`
 - **out:** `OUTPUTS/results_outputs/multi_strategy_allocation.csv`
 
-### Step 4 — `4_build_report.py` (interactive report)
-Aggregates every result into **one self-contained interactive HTML** (Plotly
-inlined — offline, no CDN). Tabs per step, sortable tables, zoomable charts.
+### Step 4 — `4_build_report.py`
+One self-contained interactive HTML (Plotly inlined, offline). Per-trade data is
+shipped into the page, so **every chart on the Portfolio tab recomputes from the
+windows you tick** — including the drawdown subplot.
 
-The per-trade data is shipped into the page and **every chart on the Portfolio
-tab recomputes from the windows you tick** — including the drawdown subplot, so
-the DD shown is always the DD of exactly that selection. Equity and drawdown
-share an x-axis (zoom one, both zoom).
-
-Portfolio tab charts: equity + drawdown subplot · monthly PnL · yearly PnL ·
-monthly heatmap (year × month) · PnL by entry hour · by weekday · by month of
-year (seasonality) · per-trade PnL histogram.
-
-Chart controls: drag to zoom · double-click to reset · modebar for
-pan / box-zoom / save-png.
-
-- **in:**  everything in `OUTPUTS/results_outputs/`
-- **out:** `OUTPUTS/report.html`  (~5 MB, open in any browser)
+- **out:** `OUTPUTS/report.html` (~5 MB, open in any browser)
 
 ## Folder map
 
 | Folder | Contents | In git? |
 |--------|----------|---------|
-| `INPUTS/data_1_optimization_input/` | MT5 optimization XMLs (RR/GG × recent/full) | no |
-| `INPUTS/data_2_maemfe_input/` | per-window MT5 trade exports (RR/, GG/, *_sweeps/) | no |
+| `INPUTS/data_2_maemfe_input/<RR\|GG>/` | the **chosen** one-file-per-window set (step 2) | no |
+| `INPUTS/data_2_maemfe_input/<STRAT>_sweeps/` | full RR sweeps per window (step 1) | no |
+| `INPUTS/data_2_maemfe_input/<STRAT>_sweeps_stats/` | MT5 `OnTester` summaries, for cross-checking | no |
+| `INPUTS/legacy_optimization_xml/` | **legacy** — the retired optimization XMLs | no |
 | `OUTPUTS/results_outputs/` | all CSV outputs | no |
-| `OUTPUTS/plots_outputs/` | static PNG plots per step | no |
-| `OUTPUTS/report.html` | the interactive report (step 4) | no |
-| `archive/` | superseded scripts (early regime study, single-strategy allocator) | no |
-| `legacy_regime_data/` | raw OHLCV / trade_stats from the abandoned regime study | no |
-| `strategy_ea.cs` | the MT5 Expert Advisor | yes |
+| `OUTPUTS/plots_outputs/` | static PNGs per step (`legacy_*` = from the XML path) | no |
+| `OUTPUTS/mt5_ini/` | generated tester configs (regenerated each run) | no |
+| `archive/` | superseded scripts, incl. `analyze_optimization_xml.py` | no |
+| `*_r_MFE_buy-stop-entry(example).cs` | the two MQL5 EAs (despite the `.cs` extension) | no |
 
-## Key config knobs (top of each script)
+## EA requirements (both RR and GG)
 
-- **Step 1:** `MAX_DD_USD`, `COMMISSION_PER_RT`, `SMOOTH_RR`, `REGIME_RR_TOL`
-- **Step 1b:** `MAX_DD_USD`, `DD_MODE`, `DD_HAIRCUT` (≈1.15 lifts MAE-based
-  floating DD to true equity DD)
-- **Step 2:** `COMMISSION_PER_RT`, `STRATEGIES` (add a strategy = add a folder)
-- **Step 3:** `ACCOUNT_NAMES` / `ACCOUNT_LIMITS` / `ACCOUNT_DD_AVAILABLE`,
-  `CAP_FRACTIONS`, `ALLOW_MIXED_STRATEGIES`, `REPLAY_ONE_POSITION`
+The pipeline depends on three EA behaviours:
 
-## Run
-
-```bash
-venv/Scripts/python.exe 1_analyze_optimization.py
-venv/Scripts/python.exe 2_analyze_maemfe.py
-venv/Scripts/python.exe 3_allocate_accounts.py
-venv/Scripts/python.exe 4_build_report.py
-```
+1. `RunTag=""` → filename derived from the enabled window via
+   `ActiveWindowLabel()`, so an export can't be mislabelled.
+2. Exports named `<window>_<RR:2dp>.csv` and opened with **`FILE_COMMON`**, so
+   every tester agent writes to one shared folder.
+3. `OnTester()` writes `<window>_<RR>_stats.csv` with MT5's own figures
+   (`STAT_EQUITY_DD` etc.) — used to cross-check Python's reconstruction.
+   Note `STAT_LR_CORRELATION` does **not** exist in MQL5; compute curve
+   straightness in Python instead.
 
 ## Notes / gotchas
 
 - MT5 exports: `mae/mfe/trade_profit` are **money**; `candle_range` is **points**.
-- Optimizations were run **without costs** — commission is applied in Python.
-- **Keep all exports pinned to one common end date.** Every period mismatch we
-  hit (XML vs per-trade DD discrepancies) came from data generated at different
-  times. XML DD ≈ true equity DD when periods match; big gaps mean stale data,
-  not intrabar effects.
-- Our MAE-based floating DD runs ~10–15% below MT5's true equity DD (MAE-timing
-  approximation) — hence `DD_HAIRCUT` in step 1b.
+  UTF-16, tab-separated, no header.
+- Backtests run **without costs**; commission ($1/round-turn) is applied in Python.
+- **Equity drawdown** is reconstructed by walking each trade as *MAE first, then
+  MFE* (a buy-stop breakout usually retraces before it runs). This reproduces
+  MT5's `STAT_EQUITY_DD` exactly — validated on 12 passes. Dropping the MFE term
+  reproduces `STAT_BALANCE_DD`. There is no fudge factor.
+- **Keep every export pinned to one common end date.** Every DD discrepancy this
+  project has hit traced back to data generated at different times. Step 0 writes
+  a `_manifest.json` per window and warns if a re-run changes symbol/dates/model.
+- Collection **overwrites** same-named files silently — intended (fresh data
+  wins), but delete a sweep folder first if you want a guaranteed-clean re-run.
 - Drawdowns are historical (2020–2026); future DD can exceed them, hence the
-  sub-100% DD cap (default 85%).
+  sub-100% DD cap (default 85%) in step 3.
 - Prop DD limit is trailing and **freezes** once the account banks its buffer,
   so the static-limit view is conservative once an account is seasoned.
+
+## Legacy
+
+`1_analyze_optimization.py` (now `archive/analyze_optimization_xml.py`) parsed
+MT5 optimization XMLs. It still works, but the XMLs are a summary-only source
+that must be regenerated in lockstep with the per-trade exports to stay
+comparable — which is exactly the failure mode that motivated step 1. Kept for
+reference; `INPUTS/legacy_optimization_xml/` holds its inputs.

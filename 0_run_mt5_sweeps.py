@@ -10,7 +10,7 @@ How the automation splits up:
 
 So `python 0_run_mt5_sweeps.py --windows 11-12 9-10` runs two optimizations and
 leaves you ~500 per-trade CSVs, already named <window>_<RR>.csv, ready for
-1b_rr_from_maemfe.py.
+1_select_rr.py.
 
 REQUIRES the EA patch (see below) — without it every pass overwrites the same
 file and the exports scatter across per-agent sandbox folders:
@@ -27,6 +27,7 @@ USAGE
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -182,6 +183,43 @@ def build_ini(win, tag, strategy, rr):
     return "\n".join(lines) + "\n"
 
 
+def check_manifest(dest_dir, strategy, rr):
+    """Record what produced this folder's data, and shout if a re-run changes it.
+
+    Collection overwrites existing files silently, so re-running a window with a
+    different date range / symbol / model would leave a folder holding a MIX of
+    two periods — exactly the staleness class of bug that has bitten this project
+    repeatedly. The manifest makes that impossible to miss.
+    """
+    cfg = STRATEGIES[strategy]
+    now = {
+        "strategy": strategy, "expert": cfg["expert"], "symbol": cfg["symbol"],
+        "period": PERIOD, "from": FROM_DATE, "to": TO_DATE, "model": MODEL,
+        "rr_start": rr[0], "rr_stop": rr[1], "rr_step": rr[2],
+    }
+    path = os.path.join(dest_dir, "_manifest.json")
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                old = json.load(fh)
+        except (OSError, ValueError):
+            old = {}
+        # only the fields that change what the DATA means
+        keys = ["expert", "symbol", "period", "from", "to", "model"]
+        diff = [k for k in keys if str(old.get(k)) != str(now[k])]
+        if diff:
+            print("      !! SETTINGS CHANGED since this folder was last filled:")
+            for k in diff:
+                print(f"         {k}: {old.get(k)!r} -> {now[k]!r}")
+            print("         Old files not covered by this sweep will remain and the"
+                  " folder will hold MIXED data.")
+            print("         Delete the folder first if you want a clean re-run.")
+    os.makedirs(dest_dir, exist_ok=True)
+    now["written"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(now, fh, indent=2)
+
+
 def collect(tag, dest_dir, stats_dir):
     """Move <tag>_*.csv out of MT5's Common\\Files into the project.
 
@@ -261,7 +299,7 @@ def main():
                   f"({n_rr} of them, plus *_stats.csv) in\n  {COMMON_FILES}")
             continue
 
-        # <STRAT>_sweeps/<window>/ is what 1b_rr_from_maemfe.py globs for.
+        # <STRAT>_sweeps/<window>/ is what 1_select_rr.py globs for.
         # (INPUTS/data_2_maemfe_input/<STRAT>/ is the separate, hand-picked set
         # of one-RR-per-window files that step 2 consumes.)
         dest = os.path.join(DEST_ROOT, f"{a.strategy}_sweeps", win)
@@ -269,6 +307,7 @@ def main():
         print(f"\n[{win}] launching MT5 ...")
         t0 = time.time()
         subprocess.run([cfg["terminal"], f"/config:{os.path.abspath(ini)}"], check=False)
+        check_manifest(dest, a.strategy, rr)
         n_tr, n_st = collect(tag, dest, stats)
         print(f"[{win}] done in {time.time()-t0:,.0f}s — {n_tr} trade CSVs -> {dest}"
               f"   |   {n_st} stats -> {stats}")
@@ -282,7 +321,7 @@ def main():
                 print(f"      check the MT5 log: {os.path.join(dd, 'logs')}")
 
     if not a.dry_run:
-        print("\nNext:  venv/Scripts/python.exe 1b_rr_from_maemfe.py")
+        print("\nNext:  venv/Scripts/python.exe 1_select_rr.py")
 
 
 if __name__ == "__main__":

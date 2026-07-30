@@ -21,7 +21,7 @@ INPUT  (one folder per window, a handful of RRs each):
 
 OUTPUT:
     OUTPUTS/results_outputs/rr_pertrade_recommendations.csv
-    OUTPUTS/plots_outputs/step1b_rr_pertrade/<STRAT>_<window>.png
+    OUTPUTS/plots_outputs/step1_rr_selection/<STRAT>_<window>.png
 """
 
 import glob
@@ -40,7 +40,7 @@ except ImportError:
 
 # ---- CONFIG -----------------------------------------------------------------
 SWEEP_ROOT = "INPUTS/data_2_maemfe_input"          # holds <STRAT>_sweeps/<window>/
-PLOT_DIR = "OUTPUTS/plots_outputs/step1b_rr_pertrade"
+PLOT_DIR = "OUTPUTS/plots_outputs/step1_rr_selection"
 OUT_CSV = "OUTPUTS/results_outputs/rr_pertrade_recommendations.csv"
 
 COMMISSION_PER_RT = 1.0     # $ per round-turn (per-trade exports were run w/o costs)
@@ -161,7 +161,7 @@ def plot_window(tag, tbl, tiers):
     ax1.grid(alpha=0.25)
     ax2 = ax1.twinx()
     ax2.plot(tbl["RR"], tbl["maxDD_capped"], "s--", color="tab:red",
-             label=f"maxDD $ ({DD_MODE}%s)" % (f" x{DD_HAIRCUT}" if DD_HAIRCUT != 1 else ""))
+             label=f"maxDD $ ({DD_MODE})")
     ax2.axhline(MAX_DD_USD, color="tab:red", ls=":", lw=1)
     ax2.set_ylabel("max drawdown $", color="tab:red")
     colors = {"recommended": "black", "aggressive": "tab:green", "maxProfit": "grey"}
@@ -244,5 +244,5 @@ if summary:
         S.to_csv(alt, index=False)
         print(f"\n({OUT_CSV} locked) Saved {alt}")
     print(f"Plots -> {PLOT_DIR}/")
-    print(f"\nDD_MODE={DD_MODE}, DD_HAIRCUT={DD_HAIRCUT} (inflates floating DD toward true "
-          "equity DD), cap=${:,.0f}. Pick from real, current data — no XML.".format(MAX_DD_USD))
+    print(f"\nDD_MODE={DD_MODE} (MAE-then-MFE walk; reproduces MT5's equity DD "
+          f"exactly), cap=${MAX_DD_USD:,.0f}. Picked from real per-trade data.")
