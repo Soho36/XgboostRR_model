@@ -67,15 +67,15 @@ TO_DATE = "2026.07.14"
 MODEL = 1            # 0=every tick, 1=1-min OHLC, 2=open prices, 4=real ticks
 
 # RR sweep: start, step, stop
-RR_START, RR_STEP, RR_STOP = 1, 0.1, 2.00
+RR_START, RR_STEP, RR_STOP = 1.0, 0.1, 2.00
 
 # 1 = SLOW COMPLETE algorithm. Do NOT use 2 (genetic) — it skips RR values.
 OPTIMIZATION_MODE = 1
 
 COMMON_FILES = os.path.join(os.environ.get("APPDATA", ""),
                             "MetaQuotes", "Terminal", "Common", "Files")
-DEST_ROOT = "INPUTS/data_2_maemfe_input"     # <STRAT>_sweeps/<window>/ goes here
-INI_DIR = "OUTPUTS/mt5_ini"
+SWEEPS_DIR = "data/1_sweeps"      # -> <STRAT>/<window>/ and <STRAT>_stats/<window>/
+INI_DIR = "run/mt5_ini"
 
 # Every window toggle the EA exposes (order irrelevant; all are forced false
 # except the target one).
@@ -304,11 +304,10 @@ def main():
                   f"({n_rr} of them, plus *_stats.csv) in\n  {COMMON_FILES}")
             continue
 
-        # <STRAT>_sweeps/<window>/ is what 1_select_rr.py globs for.
-        # (INPUTS/data_2_maemfe_input/<STRAT>/ is the separate, hand-picked set
-        # of one-RR-per-window files that step 2 consumes.)
-        dest = os.path.join(DEST_ROOT, f"{a.strategy}_sweeps", win)
-        stats = os.path.join(DEST_ROOT, f"{a.strategy}_sweeps_stats", win)
+        # data/1_sweeps/<STRAT>/<window>/ is what 1_select_rr.py globs for;
+        # its --promote then copies the winners on to data/2_chosen/<STRAT>/.
+        dest = os.path.join(SWEEPS_DIR, a.strategy, win)
+        stats = os.path.join(SWEEPS_DIR, f"{a.strategy}_stats", win)
         print(f"\n[{win}] launching MT5 ...")
         t0 = time.time()
         subprocess.run([cfg["terminal"], f"/config:{os.path.abspath(ini)}"], check=False)
@@ -319,6 +318,7 @@ def main():
         if n_tr == 0:
             dd = data_dir_for(cfg["terminal"])
             print("      ! nothing collected. Most likely causes:")
+            print("        - clear cache in MT5 terminal folder (remove optimizatons .opt)")
             print("        - symbol not available in that terminal")
             print("        - date range has no data")
             print("        - EA patch (RunTag + FILE_COMMON) not compiled in")

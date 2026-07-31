@@ -25,6 +25,7 @@ NOTE ON COMBINING: each file was backtested with only that window enabled, so
 summing them models your MULTI-ACCOUNT setup (windows run independently, no
 competition for a position slot). A SINGLE account running all windows would
 see blocking (trades routinely run past their own hour) and do worse.
+
 """
 
 import glob
@@ -39,11 +40,10 @@ matplotlib.use("Agg")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 # One entry per strategy: name -> folder of per-window trade exports.
-STRATEGIES = {"RR": "INPUTS/data_2_maemfe_input/RR",
-              "GG": "INPUTS/data_2_maemfe_input/GG"}
-PLOT_DIR = "OUTPUTS/plots_outputs/step2_portfolio"
-OUT_SUMMARY = "OUTPUTS/results_outputs/{s}_maemfe_window_summary.csv"
-OUT_TRADES = "OUTPUTS/results_outputs/{s}_maemfe_combined_trades.csv"
+STRATEGIES = {"RR": "data/2_chosen/RR", "GG": "data/2_chosen/GG"}
+PLOT_DIR = "reports/plots/step2_portfolio"
+OUT_SUMMARY = "data/3_results/{s}_maemfe_window_summary.csv"
+OUT_TRADES = "data/3_results/{s}_maemfe_combined_trades.csv"
 COMMISSION_PER_RT = 1.0   # $ per round-turn
 COLS = ["ticket", "entry_time", "exit_time", "mae", "mfe", "profit", "candle_range"]
 
@@ -213,7 +213,7 @@ def run_strategy(STRAT, MAEMFE_DIR):
   print(yearly.to_string())
 
   # ── SAVE ────────────────────────────────────────────────────────────────────
-  os.makedirs("OUTPUTS/results_outputs", exist_ok=True)
+  os.makedirs("data/3_results", exist_ok=True)
   out_all = pd.concat([W, pd.DataFrame([comb])], ignore_index=True)
   p1 = save_csv(out_all, OUT_SUMMARY.format(s=STRAT))
   p2 = save_csv(ALL[["strategy", "window", "RR", "entry_time", "exit_time", "mae",

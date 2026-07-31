@@ -15,18 +15,25 @@ close-based, MFE is intrabar), so you export a small GRID of RRs per window.
 Coarser than the XML's 251-value sweep, but real and consistent.
 
 INPUT  (one folder per window, a handful of RRs each):
-    INPUTS/data_2_maemfe_input/<STRAT>_sweeps/<window>/<window>_<RR>.csv
-    e.g. INPUTS/data_2_maemfe_input/GG_sweeps/11-12/11-12_1.5.csv
+    data/1_sweeps/<STRAT>/<window>/<window>_<RR>.csv
+    e.g. data/1_sweeps/GG/11-12/11-12_1.50.csv
     (UTF-16, tab, NO header: ticket, entry, exit, mae, mfe, profit, candle_range)
 
 OUTPUT:
-    OUTPUTS/results_outputs/rr_pertrade_recommendations.csv
-    OUTPUTS/plots_outputs/step1_rr_selection/<STRAT>_<window>.png
+    data/3_results/rr_pertrade_recommendations.csv
+    reports/plots/step1_rr_selection/<STRAT>_<window>.png
+    data/2_chosen/<STRAT>/  (with --promote)
+
+USAGE
+venv/Scripts/python.exe 1_select_rr.py --promote recommended --dry-run   # preview
+venv/Scripts/python.exe 1_select_rr.py --promote recommended             # do it
 """
 
+import argparse
 import glob
 import os
 import re
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -39,9 +46,10 @@ except ImportError:
     plt = None
 
 # ---- CONFIG -----------------------------------------------------------------
-SWEEP_ROOT = "INPUTS/data_2_maemfe_input"          # holds <STRAT>_sweeps/<window>/
-PLOT_DIR = "OUTPUTS/plots_outputs/step1_rr_selection"
-OUT_CSV = "OUTPUTS/results_outputs/rr_pertrade_recommendations.csv"
+SWEEPS_DIR = "data/1_sweeps"     # <STRAT>/<window>/  (+ <STRAT>_stats/, ignored here)
+CHOSEN_DIR = "data/2_chosen"     # --promote copies the picks here, for step 2
+PLOT_DIR = "reports/plots/step1_rr_selection"
+OUT_CSV = "data/3_results/rr_pertrade_recommendations.csv"
 
 COMMISSION_PER_RT = 1.0     # $ per round-turn (per-trade exports were run w/o costs)
 MAX_DD_USD = 2000.0         # DD cap for the tier picks (a single window's budget)
@@ -179,18 +187,86 @@ def plot_window(tag, tbl, tiers):
     return p
 
 
+# ---- PROMOTION (sweep folder -> the set step 2 consumes) --------------------
+def promote(S, tier, verdicts, dry_run):
+    """Copy the chosen RR of each qualifying window into <SWEEP_ROOT>/<STRAT>/.
+
+    Step 2 globs one file per window there, so any previously promoted file for
+    the same window is removed first — otherwise a window would be counted twice
+    at two different RRs.
+    """
+    col = f"{tier}_RR"
+    if col not in S.columns:
+        print(f"\nNothing to promote: no '{col}' column (no window had a {tier} pick).")
+        return
+    sel = S[S["verdict"].isin(verdicts) & S[col].notna()]
+    skipped = S[~S.index.isin(sel.index)]
+
+    print("\n" + "=" * 92)
+    print(f"PROMOTE  tier={tier}  verdicts={'/'.join(sorted(verdicts))}"
+          f"{'   (DRY RUN)' if dry_run else ''}")
+    print("=" * 92)
+    if not len(sel):
+        print("  nothing qualifies")
+        return
+
+    done = 0
+    for _, r in sel.iterrows():
+        strat, win, rr = r["strategy"], r["window"], float(r[col])
+        src = os.path.join(SWEEPS_DIR, strat, win, f"{win}_{rr:.2f}.csv")
+        dest_dir = os.path.join(CHOSEN_DIR, strat)
+        dest = os.path.join(dest_dir, os.path.basename(src))
+        if not os.path.isfile(src):
+            print(f"  {strat} {win:<7} MISSING {os.path.basename(src)} — skipped")
+            continue
+        # drop any earlier pick for this window (possibly a different RR)
+        stale = [p for p in glob.glob(os.path.join(dest_dir, f"{win}_*.csv"))
+                 if os.path.basename(p) != os.path.basename(dest)]
+        note = f"  (replaces {', '.join(os.path.basename(p) for p in stale)})" if stale else ""
+        print(f"  {strat} {win:<7} RR {rr:<5g} net ${r[f'{tier}_net']:>7,.0f}  "
+              f"DD ${r[f'{tier}_DD']:>6,.0f}{note}")
+        if not dry_run:
+            os.makedirs(dest_dir, exist_ok=True)
+            for p in stale:
+                os.remove(p)
+            shutil.copy2(src, dest)
+        done += 1
+
+    print(f"\n  {done} window(s) {'would be' if dry_run else ''} promoted "
+          f"-> {CHOSEN_DIR}/<STRAT>/")
+    if len(skipped):
+        print("  not promoted: " + ", ".join(
+            f"{r['strategy']} {r['window']}({r['verdict']})" for _, r in skipped.iterrows()))
+    if not dry_run:
+        print("\nNext:  venv/Scripts/python.exe 2_analyze_maemfe.py")
+
+
 # ---- MAIN -------------------------------------------------------------------
-sweep_dirs = sorted(glob.glob(os.path.join(SWEEP_ROOT, "*_sweeps", "*")))
-sweep_dirs = [d for d in sweep_dirs if os.path.isdir(d)]
+ap = argparse.ArgumentParser(description=__doc__,
+                             formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument("--promote", nargs="?", const="recommended", default=None,
+                choices=["recommended", "aggressive", "unlocked"],
+                help="copy each qualifying window's chosen RR into "
+                     "data/2_chosen/<STRAT>/ (default tier: recommended)")
+ap.add_argument("--verdicts", nargs="+", default=["OK"],
+                help="which verdicts qualify for --promote (default: OK)")
+ap.add_argument("--dry-run", action="store_true",
+                help="with --promote, show what would be copied and change nothing")
+ARGS = ap.parse_args()
+
+sweep_dirs = sorted(glob.glob(os.path.join(SWEEPS_DIR, "*", "*")))
+# <STRAT>_stats/ holds the EA's OnTester summaries, not per-trade data
+sweep_dirs = [d for d in sweep_dirs
+              if os.path.isdir(d) and not os.path.basename(os.path.dirname(d)).endswith("_stats")]
 if not sweep_dirs:
     raise SystemExit(
-        f"No sweep folders found under {SWEEP_ROOT}/<STRAT>_sweeps/<window>/.\n"
-        "Export per-trade files at a few RRs, e.g.\n"
-        f"  {SWEEP_ROOT}/GG_sweeps/11-12/11-12_1.0.csv , _1.25.csv , _1.5.csv ...")
+        f"No sweep folders found under {SWEEPS_DIR}/<STRAT>/<window>/.\n"
+        "Run step 0 first, e.g.\n"
+        "  python 0_run_mt5_sweeps.py --windows 11-12 --strategy GG --rr 0.5 3.0 0.1")
 
 summary = []
 for wdir in sweep_dirs:
-    strat = os.path.basename(os.path.dirname(wdir)).replace("_sweeps", "")
+    strat = os.path.basename(os.path.dirname(wdir))
     window = os.path.basename(wdir)
     rows = []
     for f in sorted(glob.glob(os.path.join(wdir, "*.csv"))):
@@ -246,3 +322,11 @@ if summary:
     print(f"Plots -> {PLOT_DIR}/")
     print(f"\nDD_MODE={DD_MODE} (MAE-then-MFE walk; reproduces MT5's equity DD "
           f"exactly), cap=${MAX_DD_USD:,.0f}. Picked from real per-trade data.")
+
+    print("\nVerdicts: " + ", ".join(f"{k}={v}" for k, v in
+                                     S["verdict"].value_counts().items()))
+    if ARGS.promote:
+        promote(S, ARGS.promote, set(ARGS.verdicts), ARGS.dry_run)
+    else:
+        print("Tip: --promote [recommended|aggressive|unlocked] copies the picks into "
+              "<STRAT>/ for step 2\n     (add --dry-run first; --verdicts OK WEAK to widen).")

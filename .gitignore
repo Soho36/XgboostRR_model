@@ -1,8 +1,15 @@
 /venv/
 /.idea/
 /__pycache__/
+
+# pipeline data + artefacts (regenerable)
+/data/
+/reports/
+/run/
+/legacy/
 /legacy_regime_data/
-/INPUTS/legacy_optimization_xml/
+
+# retired
 rr_model.json
 feature_importance.csv
 /archive/

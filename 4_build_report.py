@@ -13,8 +13,8 @@ Charts use Plotly (inlined, offline): drag to zoom, double-click to reset,
 modebar for pan/box-zoom/save-png. Equity and drawdown share an x-axis, so
 zooming one zooms the other.
 
-INPUT : OUTPUTS/results_outputs/*.csv   (steps 1, 1b, 2, 3)
-OUTPUT: OUTPUTS/report.html
+INPUT : data/3_results/*.csv   (steps 1, 2, 3)
+OUTPUT: reports/report.html
 """
 
 import json
@@ -24,8 +24,8 @@ import numpy as np
 import pandas as pd
 import plotly.offline as po
 
-RES = "OUTPUTS/results_outputs"
-OUT_HTML = "OUTPUTS/report.html"
+RES = "data/3_results"
+OUT_HTML = "reports/report.html"
 
 PALETTE = ["#4e79a7", "#f28e2b", "#59a14f", "#e15759", "#76b7b2", "#edc948",
            "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac", "#86bcb6", "#d37295",

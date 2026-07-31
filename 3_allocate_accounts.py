@@ -34,10 +34,10 @@ except ImportError:
 
 # ---- CONFIG -----------------------------------------------------------------
 TRADE_FILES = {
-    "RR": "OUTPUTS/results_outputs/RR_maemfe_combined_trades.csv",
-    "GG": "OUTPUTS/results_outputs/GG_maemfe_combined_trades.csv",
+    "RR": "data/3_results/RR_maemfe_combined_trades.csv",
+    "GG": "data/3_results/GG_maemfe_combined_trades.csv",
 }
-OUT_CSV = "OUTPUTS/results_outputs/multi_strategy_allocation.csv"
+OUT_CSV = "data/3_results/multi_strategy_allocation.csv"
 
 ACCOUNT_NAMES = [
     "PA-08-1500",
@@ -397,7 +397,7 @@ if (A["adjacent_hours"] == "yes").any():
         "impact is now included in profit/DD scoring."
     )
 
-os.makedirs("OUTPUTS/results_outputs", exist_ok=True)
+os.makedirs("data/3_results", exist_ok=True)
 try:
     A.to_csv(OUT_CSV, index=False)
     print(f"\nSaved {OUT_CSV}")
