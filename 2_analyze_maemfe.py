@@ -74,11 +74,17 @@ def load_file(path):
 
 
 def dd_stats(net_series):
-    """Max drawdown ($) and its recovery factor from a series of trade PnLs."""
-    eq = np.cumsum(np.asarray(net_series, dtype=float))
-    if not len(eq):
+    """Max balance drawdown ($) and recovery factor from a series of trade PnLs.
+
+    The starting balance counts as the first peak (hence the leading 0.0),
+    matching MT5's STAT_BALANCE_DD. Without it, a curve that opens with a loss
+    and never recovers above its start understates DD by that first loss.
+    """
+    raw = np.asarray(net_series, dtype=float)
+    if not len(raw):
         return 0.0, 0.0, np.array([])
-    peak = np.maximum.accumulate(eq)
+    eq = np.cumsum(raw)
+    peak = np.maximum.accumulate(np.concatenate(([0.0], eq)))[1:]
     dd = peak - eq
     maxdd = float(dd.max())
     total = float(eq[-1])

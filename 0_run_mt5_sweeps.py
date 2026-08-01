@@ -31,6 +31,7 @@ USAGE
 """
 
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -188,65 +189,187 @@ def build_ini(win, tag, strategy, rr):
     return "\n".join(lines) + "\n"
 
 
-def check_manifest(dest_dir, strategy, rr):
-    """Record what produced this folder's data, and shout if a re-run changes it.
-
-    Collection overwrites existing files silently, so re-running a window with a
-    different date range / symbol / model would leave a folder holding a MIX of
-    two periods — exactly the staleness class of bug that has bitten this project
-    repeatedly. The manifest makes that impossible to miss.
-    """
+def manifest_now(strategy, rr):
     cfg = STRATEGIES[strategy]
-    now = {
+    return {
         "strategy": strategy, "expert": cfg["expert"], "symbol": cfg["symbol"],
         "period": PERIOD, "from": FROM_DATE, "to": TO_DATE, "model": MODEL,
         "rr_start": rr[0], "rr_stop": rr[1], "rr_step": rr[2],
     }
+
+
+def manifest_warn(dest_dir, strategy, rr):
+    """Compare (do NOT write) the folder's provenance against this run.
+
+    Collection overwrites same-named files silently, so re-running a window with
+    a different date range / symbol / model leaves a folder holding a MIX of two
+    periods — the staleness class of bug that has bitten this project repeatedly.
+    """
     path = os.path.join(dest_dir, "_manifest.json")
-    if os.path.isfile(path):
-        try:
-            with open(path, encoding="utf-8") as fh:
-                old = json.load(fh)
-        except (OSError, ValueError):
-            old = {}
-        # only the fields that change what the DATA means
-        keys = ["expert", "symbol", "period", "from", "to", "model"]
-        diff = [k for k in keys if str(old.get(k)) != str(now[k])]
-        if diff:
-            print("      !! SETTINGS CHANGED since this folder was last filled:")
-            for k in diff:
-                print(f"         {k}: {old.get(k)!r} -> {now[k]!r}")
-            print("         Old files not covered by this sweep will remain and the"
-                  " folder will hold MIXED data.")
-            print("         Delete the folder first if you want a clean re-run.")
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as fh:
+            old = json.load(fh)
+    except (OSError, ValueError):
+        return
+    now = manifest_now(strategy, rr)
+    keys = ["expert", "symbol", "period", "from", "to", "model"]   # data-defining
+    diff = [k for k in keys if str(old.get(k)) != str(now[k])]
+    if diff:
+        print("      !! SETTINGS CHANGED since this folder was last filled:")
+        for k in diff:
+            print(f"         {k}: {old.get(k)!r} -> {now[k]!r}")
+        print("         Files not overwritten by this sweep will remain -> MIXED data.")
+        print("         Delete the folder first if you want a clean re-run.")
+
+
+def manifest_write(dest_dir, strategy, rr, n_files):
+    """Written only AFTER a successful collection, so a failed run can never
+    leave old data stamped with new settings."""
     os.makedirs(dest_dir, exist_ok=True)
-    now["written"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(now, fh, indent=2)
+    rec = manifest_now(strategy, rr)
+    rec["written"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    rec["files_collected"] = n_files
+    with open(os.path.join(dest_dir, "_manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(rec, fh, indent=2)
 
 
-def collect(tag, dest_dir, stats_dir):
+def mt5_log_tail(terminal_exe, nbytes=400_000):
+    # Generous window: a *successful* optimization writes a line per pass (300+),
+    # which can flush an earlier LiveUpdate handoff out of a small tail.
+    """Tail of that terminal's newest log (UTF-8/UTF-16 tolerant)."""
+    dd = data_dir_for(terminal_exe)
+    if not dd:
+        return ""
+    # Terminal logs are named YYYYMMDD.log; the folder also holds metaeditor.log,
+    # which sorts AFTER them alphabetically — so filter, then take newest by mtime.
+    logs = [p for p in glob.glob(os.path.join(dd, "logs", "*.log"))
+            if os.path.basename(p)[:8].isdigit()]
+    if not logs:
+        return ""
+    logs.sort(key=os.path.getmtime)
+    try:
+        with open(logs[-1], "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            start = max(0, fh.tell() - nbytes)
+            fh.seek(start - (start % 2))        # keep UTF-16 code units aligned
+            raw = fh.read()
+    except OSError:
+        return ""
+    # MT5 writes these logs as UTF-16LE. Decoding as UTF-8 with errors="ignore"
+    # never raises — it silently mangles the text and substring searches fail —
+    # so pick the encoding from NUL density rather than guessing.
+    if raw.count(b"\x00") > len(raw) // 4:
+        return raw.decode("utf-16-le", errors="ignore")
+    return raw.decode("utf-8", errors="ignore")
+
+
+def count_new(tag, since):
+    """Per-trade files for `tag` written at/after `since` (stats excluded)."""
+    if not os.path.isdir(COMMON_FILES):
+        return 0
+    n = 0
+    for f in os.listdir(COMMON_FILES):
+        low = f.lower()
+        if not (f.startswith(tag + "_") and low.endswith(".csv")) or low.endswith("_stats.csv"):
+            continue
+        try:
+            if os.path.getmtime(os.path.join(COMMON_FILES, f)) >= since - 2:
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
+def wait_for_sweep(tag, n_expected, since, poll=3.0, quiet_for=120.0, hard_timeout=7200):
+    """subprocess.run() returning does NOT mean the test actually ran.
+
+    MT5's LiveUpdate can hand our /config to a second process and exit at once
+    (log: 'LiveUpdate start ... /update', then 'terminal process already
+    started'). The real test then finishes minutes later — after we have moved
+    on to the next window. So wait on the FILES, not on the process exiting.
+
+    Returns (files_seen, status) where status is complete | stalled | nothing.
+    """
+    t_start = time.time()
+    last_n, last_change = -1, time.time()
+    while True:
+        n = count_new(tag, since)
+        if n >= n_expected:
+            return n, "complete"
+        if n != last_n:
+            last_n, last_change = n, time.time()
+        if time.time() - last_change > quiet_for:
+            return n, ("stalled" if n else "nothing")
+        if time.time() - t_start > hard_timeout:
+            return n, "timeout"
+        time.sleep(poll)
+
+
+def liveupdate_hijack(terminal_exe):
+    """True when the newest log shows MT5 relaunching itself for an update."""
+    tail = mt5_log_tail(terminal_exe)
+    return ("LiveUpdate" in tail and "/update" in tail) or \
+           ("terminal process already started" in tail)
+
+
+def purge_common(tag):
+    """Remove stale <tag>_*.csv from MT5's SHARED Common\\Files before a run.
+
+    Both strategies write there and filenames carry only the window (no strategy,
+    no run id), so a leftover 2-3_1.50.csv from an interrupted RR run would be
+    collected into the next GG run for 2-3. Anything matching is stale by
+    definition here — we are about to regenerate it.
+    """
+    if not os.path.isdir(COMMON_FILES):
+        return 0
+    n = 0
+    for f in os.listdir(COMMON_FILES):
+        if f.startswith(tag + "_") and f.lower().endswith(".csv"):
+            try:
+                os.remove(os.path.join(COMMON_FILES, f))
+                n += 1
+            except OSError:
+                pass
+    if n:
+        print(f"      (purged {n} stale {tag}_*.csv from Common\\Files before running)")
+    return n
+
+
+def collect(tag, dest_dir, stats_dir, since):
     """Move <tag>_*.csv out of MT5's Common\\Files into the project.
+
+    `since` = the moment this run's MT5 was launched. Only files written at or
+    after that are taken, so anything left behind by an earlier/other-strategy
+    run cannot be absorbed into this one (filenames carry no strategy or run id).
 
     Per-trade files go to dest_dir; the EA's OnTester summaries (*_stats.csv)
     go to stats_dir so they don't confuse the per-trade globs downstream.
     """
     if not os.path.isdir(COMMON_FILES):
         print(f"  ! Common folder not found: {COMMON_FILES}")
-        return 0, 0
+        return 0, 0, 0
     os.makedirs(dest_dir, exist_ok=True)
     os.makedirs(stats_dir, exist_ok=True)
-    n_tr = n_st = 0
+    n_tr = n_st = n_skip = 0
     for f in os.listdir(COMMON_FILES):
         if not (f.startswith(tag + "_") and f.lower().endswith(".csv")):
             continue
+        src = os.path.join(COMMON_FILES, f)
+        try:
+            if os.path.getmtime(src) < since - 2:      # 2s slack for clock/FS jitter
+                n_skip += 1
+                continue
+        except OSError:
+            continue
         if f.lower().endswith("_stats.csv"):
-            shutil.move(os.path.join(COMMON_FILES, f), os.path.join(stats_dir, f))
+            shutil.move(src, os.path.join(stats_dir, f))
             n_st += 1
         else:
-            shutil.move(os.path.join(COMMON_FILES, f), os.path.join(dest_dir, f))
+            shutil.move(src, os.path.join(dest_dir, f))
             n_tr += 1
-    return n_tr, n_st
+    return n_tr, n_st, n_skip
 
 
 def main():
@@ -309,12 +432,38 @@ def main():
         dest = os.path.join(SWEEPS_DIR, a.strategy, win)
         stats = os.path.join(SWEEPS_DIR, f"{a.strategy}_stats", win)
         print(f"\n[{win}] launching MT5 ...")
+        manifest_warn(dest, a.strategy, rr)     # compare only; write after success
+        purge_common(tag)                       # drop leftovers from any earlier run
         t0 = time.time()
         subprocess.run([cfg["terminal"], f"/config:{os.path.abspath(ini)}"], check=False)
-        check_manifest(dest, a.strategy, rr)
-        n_tr, n_st = collect(tag, dest, stats)
+
+        # The process exiting proves nothing — wait until the files are actually there.
+        seen, status = wait_for_sweep(tag, n_rr, t0)
+        if status != "complete":
+            if liveupdate_hijack(cfg["terminal"]):
+                raise SystemExit(
+                    f"\nABORTING at [{win}] — MT5 LiveUpdate is hijacking the launch.\n"
+                    f"  The terminal wants to update itself, fails to replace its own\n"
+                    f"  exe, spawns an updater with our /config and exits immediately,\n"
+                    f"  so the tester never runs (or runs minutes later, unattended).\n\n"
+                    f"  FIX: open this terminal by hand and let the update finish:\n"
+                    f"    {cfg['terminal']}\n"
+                    f"  Restart it, confirm Help > About shows the new build, close it,\n"
+                    f"  then re-run this script. Nothing here is salvageable until then.")
+            print(f"      ! run did not complete ({status}): {seen}/{n_rr} files after "
+                  f"{time.time()-t0:,.0f}s")
+
+        n_tr, n_st, n_skip = collect(tag, dest, stats, since=t0)
         print(f"[{win}] done in {time.time()-t0:,.0f}s — {n_tr} trade CSVs -> {dest}"
               f"   |   {n_st} stats -> {stats}")
+        if n_skip:
+            print(f"      (ignored {n_skip} {tag}_*.csv older than this run — "
+                  f"not produced by it)")
+        if n_tr:
+            manifest_write(dest, a.strategy, rr, n_tr)
+        if n_tr and n_tr != n_rr:
+            print(f"      ! expected {n_rr} trade CSVs but got {n_tr} — the sweep "
+                  f"may be incomplete; this folder now holds a MIX of runs.")
         if n_tr == 0:
             dd = data_dir_for(cfg["terminal"])
             print("      ! nothing collected. Most likely causes:")
