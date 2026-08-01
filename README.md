@@ -70,10 +70,35 @@ launching — a wrong Expert path otherwise makes MT5 exit in ~8s with no output
 ### 1 — `1_select_rr.py`
 Per-window RR tiers (`recommended` / `aggressive` / `unlocked`) from the real
 per-trade sweeps, with the DD cap applied to **equity** drawdown.
+
+Picks are judged by their **±`SMOOTH_RR` neighbourhood** (mean profit, *worst*
+neighbour DD), not by a single RR value — TP is close-based, so one 0.01 step can
+flip individual trades and create cliffs, and a pick one step from a cliff is
+fragile by construction.
+
+Every pass is **cross-checked against MT5's own `_stats.csv`** and the script
+aborts before promoting if the two disagree (`--no-validate` overrides).
+
+Also scores **equity-curve shape**: `lr_r` (straightness) and `recent_net`
+(profit in the last `RECENT_YEARS`), flagged `ALIVE` / `FADING` / `STALE`.
+A **conflict** is a tradeable verdict (OK/WEAK) whose shape is STALE or FADING —
+the totals say yes but the edge is historical. Shape is *reported, never
+auto-filtered*; drop one by hand with `--exclude RR/5-6`.
+
 `--promote <tier>` copies each qualifying window's chosen file into
 `data/2_chosen/` (removing any earlier pick for that window, so step 2 can't
 count a window twice). `--verdicts OK WEAK` widens the filter; `--dry-run`
 previews.
+
+- **in:**  `data/1_sweeps/<RR|GG>/<window>/` (+ `<STRAT>_stats/` for validation)
+- **out:** `data/3_results/rr_pertrade_recommendations.csv`
+- **out:** `reports/step1_rr_selection.html` — sortable table + equity curve per
+  window, conflicts highlighted, filters incl. **Conflicts only**. This is the
+  page that replaces "open MT5 and re-run this window by hand" when a row looks
+  contradictory.
+- **out:** `reports/step1_rr_sweeps.html` — profit / drawdown vs RR per window,
+  with the under-cap band shaded and the tier picks marked (the old PNGs, in one
+  page; PNGs still written to `reports/plots/step1_rr_selection/`).
 
 ### 2 — `2_analyze_maemfe.py`
 Real equity curves, drawdowns, per-year breakdowns, combined portfolio and a
