@@ -750,11 +750,20 @@ STRATS.forEach(st=>{
 
 # ---- PROMOTION (sweep folder -> the set step 2 consumes) --------------------
 def promote(S, tier, verdicts, dry_run):
-    """Copy the chosen RR of each qualifying window into <SWEEP_ROOT>/<STRAT>/.
+    """Copy the chosen RR of each qualifying window into <CHOSEN_DIR>/<STRAT>/.
 
-    Step 2 globs one file per window there, so any previously promoted file for
-    the same window is removed first — otherwise a window would be counted twice
-    at two different RRs.
+    Step 2 globs *every* .csv in that folder as "the current portfolio", so this
+    must leave it in a state that exactly matches THIS run's promote decision —
+    not "this run's decision, plus whatever leftovers happened to survive from a
+    previous run with a different tier/verdict/exclude set." A window that WAS
+    promoted last time but no longer qualifies (verdict changed, excluded, etc.)
+    must not silently keep contributing its old file.
+
+    So for every strategy this run actually scanned (i.e. present in S), the
+    destination folder is fully cleared before the qualifying picks are copied
+    back in — never partially patched. Strategies NOT scanned this run (e.g. you
+    only pointed SWEEPS_DIR at RR) are left untouched, since we have no current
+    opinion about them.
     """
     col = f"{tier}_RR"
     if col not in S.columns:
@@ -788,6 +797,25 @@ def promote(S, tier, verdicts, dry_run):
         print("  nothing qualifies")
         return
 
+    # Clear every scanned strategy's folder up front — not per-window — so the
+    # result is exactly this run's decision, no partial leftovers from a prior
+    # tier/verdict/exclude combination.
+    scanned_strats = sorted(S["strategy"].unique())
+    for strat in scanned_strats:
+        dest_dir = os.path.join(CHOSEN_DIR, strat)
+        old = sorted(glob.glob(os.path.join(dest_dir, "*.csv")))
+        keep = {f"{r['window']}_{float(r[col]):.2f}.csv"
+                for _, r in sel[sel["strategy"] == strat].iterrows()}
+        removing = [p for p in old if os.path.basename(p) not in keep]
+        if removing:
+            print(f"  {strat}: clearing {len(removing)} file(s) from {dest_dir}/ "
+                  f"{'(dry run, not removed)' if dry_run else ''}")
+            if not dry_run:
+                for p in removing:
+                    os.remove(p)
+        if not dry_run:
+            os.makedirs(dest_dir, exist_ok=True)
+
     done = 0
     for _, r in sel.iterrows():
         strat, win, rr = r["strategy"], r["window"], float(r[col])
@@ -797,22 +825,16 @@ def promote(S, tier, verdicts, dry_run):
         if not os.path.isfile(src):
             print(f"  {strat} {win:<7} MISSING {os.path.basename(src)} — skipped")
             continue
-        # drop any earlier pick for this window (possibly a different RR)
-        stale = [p for p in glob.glob(os.path.join(dest_dir, f"{win}_*.csv"))
-                 if os.path.basename(p) != os.path.basename(dest)]
-        note = f"  (replaces {', '.join(os.path.basename(p) for p in stale)})" if stale else ""
         print(f"  {strat} {win:<7} RR {rr:<5g} net ${r[f'{tier}_net']:>7,.0f}  "
               f"DD ${r[f'{tier}_DD']:>6,.0f}  shape={r.get('shape', ''):<6}"
-              f" last{RECENT_YEARS:g}y=${r.get(f'{tier}_recentNet', float('nan')):>7,.0f}{note}")
+              f" last{RECENT_YEARS:g}y=${r.get(f'{tier}_recentNet', float('nan')):>7,.0f}")
         if not dry_run:
-            os.makedirs(dest_dir, exist_ok=True)
-            for p in stale:
-                os.remove(p)
             shutil.copy2(src, dest)
         done += 1
 
     print(f"\n  {done} window(s) {'would be' if dry_run else ''} promoted "
-          f"-> {CHOSEN_DIR}/<STRAT>/")
+          f"-> {CHOSEN_DIR}/<STRAT>/  (folder{'s' if len(scanned_strats)>1 else ''} "
+          f"for {', '.join(scanned_strats)} fully replaced, not merged)")
     if len(skipped):
         print("  not promoted: " + ", ".join(
             f"{r['strategy']} {r['window']}({r['verdict']})" for _, r in skipped.iterrows()))
