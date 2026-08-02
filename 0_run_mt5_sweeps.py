@@ -39,6 +39,8 @@ import subprocess
 # import sys
 import time
 
+import provenance as prov
+
 # ---- CONFIG: set these once -------------------------------------------------
 # Each strategy has its OWN MT5 installation here, so terminal/expert/symbol are
 # all per-strategy. "expert" is relative to MQL5\Experts\ in that terminal's DATA
@@ -49,11 +51,14 @@ STRATEGIES = {
         "terminal": r"I:\Programs\1AMP Global (USA) MT5 Exchange-Traded Futures Only\terminal64.exe",
         "expert": r"444\RR_r_MFE_buy-stop-entry.ex5",
         "symbol": "MNQcontDATABENTOcurr6",
+        # repo working copy, compared against the DEPLOYED .mq5 to catch drift
+        "repo_source": "RR_r_MFE_buy-stop-entry(example).cs",
     },
     "GG": {
         "terminal": r"I:\Programs\1MetaTrader 5\terminal64.exe",
         "expert": r"555\GG_r_MFE_buy-stop-entry.ex5",
         "symbol": "MNQcontDATABENTOcurr6",
+        "repo_source": "GG_r_MFE_buy-stop-entry(example).cs",
     },
 }
 PERIOD = "M30"
@@ -224,13 +229,28 @@ def manifest_warn(dest_dir, strategy, rr):
         print("         Delete the folder first if you want a clean re-run.")
 
 
-def manifest_write(dest_dir, strategy, rr, n_files):
+def manifest_write(dest_dir, strategy, rr, n_files, expected):
     """Written only AFTER a successful collection, so a failed run can never
-    leave old data stamped with new settings."""
+    leave old data stamped with new settings.
+
+    Records completeness explicitly: a partial sweep still leaves usable files,
+    but downstream must be able to see that the folder is a MIX of runs rather
+    than one clean sweep. Step 1 refuses to promote from an incomplete folder.
+    """
     os.makedirs(dest_dir, exist_ok=True)
+    cfg = STRATEGIES[strategy]
     rec = manifest_now(strategy, rr)
     rec["written"] = time.strftime("%Y-%m-%d %H:%M:%S")
     rec["files_collected"] = n_files
+    rec["expected"] = expected
+    rec["complete"] = bool(n_files == expected)
+    # WHO produced this data: run id, analysis-code revision, and the identity of
+    # the strategy MT5 actually executed (not the repo copy of it).
+    rec["run_id"] = prov.RUN_ID
+    rec["git"] = prov.git_info()
+    rec["ea"] = prov.ea_info(cfg["terminal"], cfg["expert"],
+                             data_dir_for(cfg["terminal"]),
+                             cfg.get("repo_source"))
     with open(os.path.join(dest_dir, "_manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(rec, fh, indent=2)
 
@@ -413,6 +433,18 @@ def main():
                              "Fix STRATEGIES[%r] at the top of this script."
                              % (a.strategy, "\n    ".join(problems), a.strategy))
         print("  preflight OK (terminal + expert found)")
+        _ea = prov.ea_info(cfg["terminal"], cfg["expert"],
+                           data_dir_for(cfg["terminal"]), cfg.get("repo_source"))
+        _ex5 = _ea.get("expert_ex5") or {}
+        print(f"  run {prov.RUN_ID} | EA {_ex5.get('sha256_16')} "
+              f"(built {_ex5.get('mtime')})")
+        if _ea.get("ex5_newer_than_mq5") is False:
+            print("  !! the .ex5 is OLDER than its .mq5 — MT5 will run STALE logic. "
+                  "Recompile before sweeping.")
+        if _ea.get("repo_matches_deployed") is False:
+            print("  !! the deployed .mq5 DIFFERS from the repo copy "
+                  f"({cfg.get('repo_source')}) — analysis would be reproducible "
+                  "but the strategy would not.")
 
     os.makedirs(INI_DIR, exist_ok=True)
     for win in a.windows:
@@ -460,7 +492,7 @@ def main():
             print(f"      (ignored {n_skip} {tag}_*.csv older than this run — "
                   f"not produced by it)")
         if n_tr:
-            manifest_write(dest, a.strategy, rr, n_tr)
+            manifest_write(dest, a.strategy, rr, n_tr, n_rr)
         if n_tr and n_tr != n_rr:
             print(f"      ! expected {n_rr} trade CSVs but got {n_tr} — the sweep "
                   f"may be incomplete; this folder now holds a MIX of runs.")

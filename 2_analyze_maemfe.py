@@ -36,6 +36,8 @@ import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 
+import provenance as prov
+
 matplotlib.use("Agg")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
@@ -71,6 +73,28 @@ def load_file(path):
     df = df.dropna(subset=["exit_time", "profit"]).reset_index(drop=True)
     df["net"] = df["profit"] - COMMISSION_PER_RT
     return df
+
+
+def load_calibration(path="data/3_results/dd_calibration.csv"):
+    """Per-(strategy, window, RR) DD scale factors written by step 1.
+
+    Step 1 calibrates its equity-DD reconstruction against MT5's own
+    STAT_EQUITY_DD. Without importing those factors here, the RR *pick* would be
+    cautious while the portfolio/account DD stayed optimistic on exactly the
+    passes where our intra-trade ordering assumption is wrong.
+    """
+    out = {}
+    if os.path.exists(path):
+        try:
+            c = pd.read_csv(path)
+            for r in c.itertuples(index=False):
+                out[(r.strategy, r.window, round(float(r.RR), 2))] = float(r.dd_factor)
+        except Exception as e:
+            print(f"  (could not read {path}: {e})")
+    return out
+
+
+CALIB = load_calibration()
 
 
 def dd_stats(net_series):
@@ -116,10 +140,10 @@ def dd_floating(net_series, mae_series, mfe_series):
     return float(maxdd)
 
 
-def summarise(df, label, rr=None):
+def summarise(df, label, rr=None, dd_factor=1.0):
     net = df["net"].values
     maxdd, rec, _ = dd_stats(net)
-    maxdd_f = dd_floating(net, df["mae"].values, df["mfe"].values)
+    maxdd_f = dd_floating(net, df["mae"].values, df["mfe"].values) * dd_factor
     wins, losses = net[net > 0], net[net < 0]
     pf = wins.sum() / abs(losses.sum()) if losses.sum() != 0 else np.inf
     # max consecutive losses
@@ -180,7 +204,7 @@ def run_strategy(STRAT, MAEMFE_DIR):
         continue
     df["window"], df["RR"] = win, rr
     frames.append(df)
-    rows.append(summarise(df, win, rr))
+    rows.append(summarise(df, win, rr, CALIB.get((STRAT, win, round(rr, 2)), 1.0)))
 
   W = pd.DataFrame(rows)
   W["_h"] = W["window"].str.split("-").str[0].astype(int)
@@ -192,7 +216,10 @@ def run_strategy(STRAT, MAEMFE_DIR):
   ALL["equity"] = ALL["net"].cumsum()
   peak = ALL["equity"].cummax()
   ALL["drawdown"] = ALL["equity"] - peak
-  comb = summarise(ALL, "== COMBINED ==", None)
+  # conservative for the combined view: worst factor among the windows in it
+  comb_f = max([CALIB.get((STRAT, w, round(r, 2)), 1.0)
+                for w, r in zip(W["window"], W["RR"])] or [1.0])
+  comb = summarise(ALL, "== COMBINED ==", None, comb_f)
 
   print("\n" + "=" * 118)
   print(f"[{STRAT}] PER-WINDOW RESULTS (net of ${COMMISSION_PER_RT:.0f}/round-turn commission)")
@@ -301,3 +328,17 @@ if len(results) > 1:
 
 print("\nNOTE: combined = windows run independently (multi-account setup). One account")
 print("running everything would hit position-slot blocking and do worse.")
+
+# ── PROVENANCE ────────────────────────────────────────────────────────────────
+PROV2 = prov.base(
+    "2_analyze_maemfe",
+    upstream=prov.load("data/3_results/_provenance_step1.json"),
+    chosen_files={s: sorted(os.path.basename(p)
+                            for p in glob.glob(os.path.join(d, "*.csv")))
+                  for s, d in STRATEGIES.items()},
+    calibration_entries=len(CALIB),
+    calibration_max=max(CALIB.values()) if CALIB else 1.0,
+    commission_per_rt=COMMISSION_PER_RT,
+)
+prov.write("data/3_results/_provenance_step2.json", PROV2)
+print("\nProvenance: " + prov.summary_line(PROV2))

@@ -26,6 +26,8 @@ import os
 import numpy as np
 import pandas as pd
 
+import provenance as prov
+
 try:
     from scipy.optimize import Bounds, LinearConstraint, milp
 except ImportError:
@@ -97,6 +99,20 @@ for strat, path in TRADE_FILES.items():
     d["strategy"] = strat
     frames.append(d)
 T = pd.concat(frames, ignore_index=True).sort_values("exit_time").reset_index(drop=True)
+
+# DD calibration from step 1 (see combo_factor). Without it the RR picks would be
+# cautious while this script's hard DD constraint stayed optimistic.
+CALIB = {}
+_cal = "data/3_results/dd_calibration.csv"
+if os.path.exists(_cal):
+    try:
+        _c = pd.read_csv(_cal)
+        CALIB = {(r.strategy, r.window, round(float(r.RR), 2)): float(r.dd_factor)
+                 for r in _c.itertuples(index=False)}
+    except Exception as _e:
+        print(f"  (could not read {_cal}: {_e})")
+print(f"DD calibration: {len(CALIB)} pass(es) scaled up"
+      + (f" (max x{max(CALIB.values()):.3f})" if CALIB else " — none needed"))
 
 KEYS = sorted(
     T.groupby(["strategy", "window"]).groups.keys(),
@@ -173,19 +189,33 @@ def combo_trade_frame(combo):
     return T[T["kidx"].isin(combo)].copy()
 
 
+def combo_factor(combo):
+    """Worst DD calibration factor among the windows on this account.
+
+    Step 1 measured, per (strategy, window, RR), how much our equity-DD walk
+    understated MT5's true STAT_EQUITY_DD. MT5 only ever tested single windows,
+    so there is no ground truth for a COMBINATION — taking the worst
+    constituent factor is the conservative choice for a hard DD limit.
+    """
+    return max([CALIB.get((KEYS[i][0], KEYS[i][1], round(float(RR_OF[i]), 2)), 1.0)
+                for i in combo] or [1.0])
+
+
 def combo_metrics(combo):
     isolated = combo_trade_frame(combo)
     effective = replay_one_position(isolated) if REPLAY_ONE_POSITION else isolated
+    fac = combo_factor(combo)
     return {
         "combo": tuple(combo),
         "mask": combo_mask(combo),
         "strategy": combo_strategy(combo),
         "profit": float(effective["net"].sum()),
-        "dd": max_dd_floating(effective),
+        "dd": max_dd_floating(effective) * fac,
         "trades": int(len(effective)),
         "blocked_trades": int(len(isolated) - len(effective)),
         "isolated_profit": float(isolated["net"].sum()),
-        "isolated_dd": max_dd_floating(isolated),
+        "isolated_dd": max_dd_floating(isolated) * fac,
+        "dd_factor": fac,
     }
 
 
@@ -412,3 +442,20 @@ except PermissionError:
         print(f"\nCould not save {OUT_CSV}: permission denied or file locked.")
 print("\nEach account is strategy-pure unless ALLOW_MIXED_STRATEGIES=True.")
 print("Add accounts by extending ACCOUNT_NAMES, ACCOUNT_LIMITS, and ACCOUNT_DD_AVAILABLE.")
+
+# ---- PROVENANCE -------------------------------------------------------------
+PROV3 = prov.base(
+    "3_allocate_accounts",
+    upstream=prov.load("data/3_results/_provenance_step2.json"),
+    accounts=dict(zip(ACCOUNT_NAMES, ACCOUNT_DD_AVAILABLE)),
+    report_fraction=REPORT_FRACTION,
+    cap_fractions=CAP_FRACTIONS,
+    calibration_entries=len(CALIB),
+    calibration_max=max(CALIB.values()) if CALIB else 1.0,
+    settings={"MAX_WINDOWS_PER_ACCOUNT": MAX_WINDOWS_PER_ACCOUNT,
+              "ALLOW_MIXED_STRATEGIES": ALLOW_MIXED_STRATEGIES,
+              "REPLAY_ONE_POSITION": REPLAY_ONE_POSITION,
+              "FORBID_ADJACENT_WINDOWS": FORBID_ADJACENT_WINDOWS},
+)
+prov.write("data/3_results/_provenance_step3.json", PROV3)
+print("\nProvenance: " + prov.summary_line(PROV3))

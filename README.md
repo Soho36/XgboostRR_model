@@ -48,16 +48,16 @@ stage and writes the next:
 
 ```bash
 # 0. sweep every window across an RR range (drives MT5 headlessly)
-venv/Scripts/python.exe 0_run_mt5_sweeps.py --windows 2-3 3-4 --strategy RR --rr 0.5 3.0 0.1
+python 0_run_mt5_sweeps.py --windows 2-3 3-4 --strategy RR --rr 0.5 3.0 0.1
 
 # 1. pick the RR per window, then copy the winners into data/2_chosen/
-venv/Scripts/python.exe 1_select_rr.py --promote recommended --dry-run
-venv/Scripts/python.exe 1_select_rr.py --promote recommended
+python 1_select_rr.py --promote recommended --dry-run
+python 1_select_rr.py --promote recommended
 
 # 2-4. portfolio, allocation, report
-venv/Scripts/python.exe 2_analyze_maemfe.py
-venv/Scripts/python.exe 3_allocate_accounts.py
-venv/Scripts/python.exe 4_build_report.py
+python 2_analyze_maemfe.py
+python 3_allocate_accounts.py
+python 4_build_report.py
 ```
 
 ### 0 — `0_run_mt5_sweeps.py`
@@ -131,6 +131,31 @@ the change has no effect. CLI compile:
 `metaeditor64.exe /compile:"<abs .mq5>" /log:"<abs .log>"` (exit code is
 unreliable; check the `.ex5` timestamp).
 
+## Provenance — "which result is this?"
+
+Every step stamps what produced it, so no artefact is anonymous:
+
+- `provenance.py` supplies a per-interpreter **run id**, the analysis-code git
+  revision (+ dirty flag), and file hashes.
+- Step 0 records in each `_manifest.json`: run id, data cutoff, sweep
+  completeness, and the identity of the **strategy MT5 actually executed** —
+  SHA-256 of the deployed `.ex5` and its `.mq5`, whether the `.ex5` is newer
+  than its source (stale-compile check), and whether that `.mq5` still matches
+  the repo's `*(example).cs`.
+- Steps 1–4 each write `data/3_results/_provenance_step<N>.json`, chaining the
+  step before it, and print a one-line banner.
+- Both step-1 HTMLs and `reports/report.html` carry a **Provenance** panel: run
+  ids for the whole chain, data cutoff, validation counts, DD-calibration
+  extent, EA hashes, any overrides used, and warnings.
+
+Warnings surfaced automatically: uncommitted analysis code · deployed `.mq5`
+differing from the repo copy · `.ex5` older than its `.mq5` · sweeps spanning
+more than one data cutoff · unknown EA identity · any override in effect.
+
+> The repo holds `*(example).cs` working copies while MT5 runs a compiled `.ex5`
+> elsewhere. Hashing the deployed binary is what keeps "the analysis is
+> reproducible" from quietly coexisting with "the strategy is not".
+
 ## Notes / gotchas
 
 - MT5 exports: `mae/mfe/trade_profit` are **money**; `candle_range` is **points**.
@@ -140,6 +165,19 @@ unreliable; check the `.ex5` timestamp).
   usually retraces before it runs). This reproduces MT5's `STAT_EQUITY_DD`
   exactly — validated on 12 passes. Dropping the MFE term reproduces
   `STAT_BALANCE_DD`. No fudge factor.
+- **MT5 timestamps are naive broker time.** They are encoded as
+  epoch-treated-as-UTC and must be decoded with **UTC getters** (`getUTCHours`,
+  `getUTCDay`, …). Using local-time getters re-interprets them in the viewer's
+  zone — on a UTC+2/+3 machine window "2-3" showed up as hour 4-5, and the shift
+  is DST-dependent so it also moved trades across day/month boundaries.
+- **DD calibration flows step 1 → 2 → 3** via `data/3_results/dd_calibration.csv`.
+  Step 1 measures how far our equity-DD walk sits below MT5's `STAT_EQUITY_DD`
+  per pass; steps 2 and 3 scale by it (step 3 uses the *worst* factor among an
+  account's windows, since MT5 never tested combinations). Without this the RR
+  pick is cautious while the account DD constraint stays optimistic.
+- **Unverified data cannot be promoted.** Step 0 records `complete` in each
+  `_manifest.json`; step 1 blocks promotion of incomplete sweeps or windows with
+  no `_stats.csv` unless you pass `--allow-unvalidated`.
 - **Keep every export pinned to one common end date.** Every DD discrepancy this
   project hit traced back to data generated at different times. Step 0 writes a
   `_manifest.json` per window and warns if a re-run changes symbol/dates/model.

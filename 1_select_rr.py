@@ -39,6 +39,8 @@ import shutil
 import numpy as np
 import pandas as pd
 
+import provenance as prov
+
 try:
     import matplotlib
     matplotlib.use("Agg")
@@ -51,6 +53,8 @@ SWEEPS_DIR = "data/1_sweeps"     # <STRAT>/<window>/  (+ <STRAT>_stats/, ignored
 CHOSEN_DIR = "data/2_chosen"     # --promote copies the picks here, for step 2
 PLOT_DIR = "reports/plots/step1_rr_selection"
 OUT_CSV = "data/3_results/rr_pertrade_recommendations.csv"
+OUT_CALIB = "data/3_results/dd_calibration.csv"   # consumed by steps 2 and 3
+OUT_PROV = "data/3_results/_provenance_step1.json"
 OUT_HTML = "reports/step1_rr_selection.html"        # table + equity curve per window
 OUT_HTML_SWEEP = "reports/step1_rr_sweeps.html"     # profit/DD vs RR per window
 
@@ -155,7 +159,7 @@ def metrics(df, mt5_eq_dd=None):
     top = np.sort(net)[::-1]                    # best trades first, for concentration
     mae, mfe = df["mae"].values, df["mfe"].values
     dd = (dd_equity(net, mae, mfe) if DD_MODE == "equity" else dd_closed(net))
-    calibrated = False
+    calibrated, factor = False, 1.0
     if mt5_eq_dd is not None and DD_MODE == "equity":
         ours_gross = dd_equity(df["profit"].values, mae, mfe)
         if ours_gross > 0:
@@ -163,11 +167,14 @@ def metrics(df, mt5_eq_dd=None):
             if factor > 1.0:                    # never talk risk DOWN
                 dd *= factor
                 calibrated = abs(factor - 1.0) > 1e-9
+            else:
+                factor = 1.0
     dd_capped = dd
     wins, losses = net[net > 0], net[net < 0]
     pf = wins.sum() / abs(losses.sum()) if losses.sum() != 0 else np.inf
     tot = float(net.sum())
     return {
+        "dd_factor": round(factor, 4) if calibrated else 1.0,
         "trades": len(df),
         "net_profit": round(tot),
         "maxDD": round(dd),
@@ -206,7 +213,7 @@ def shape_of(row):
                    paper but the curve is not actually trending up.
     FADING       — profitable and trending, but the recent period contributed
                    under FADING_SHARE of the total: most of the edge is history.
-    ALIVE        — none of the above.
+    ALIVE        — none of the above and in profit.
     """
     if row is None:
         return ""
@@ -418,7 +425,7 @@ def equity_for(strat, window, rr):
     return {"rr": float(rr), "x": xs, "y": ys}
 
 
-def write_html(S, pages, mode, out_path):
+def write_html(S, pages, mode, out_path, prov_rec=None):
     """Self-contained page: sortable table + one chart per window.
 
     mode="equity" -> equity curve at the picked RR (the conflict-spotting view:
@@ -448,6 +455,8 @@ def write_html(S, pages, mode, out_path):
         "smooth": SMOOTH_RR,
         "recent_years": RECENT_YEARS,
         "lr_min": LR_MIN,
+        "prov": prov_rec or {},
+        "prov_warnings": prov.warnings_for(prov_rec) if prov_rec else [],
     }
     title = ("Step 1 — RR selection: equity curves" if mode == "equity"
              else "Step 1 — RR sweeps: profit / drawdown vs RR")
@@ -513,6 +522,10 @@ _TEMPLATE = r"""<!DOCTYPE html>
  .warn{background:#fff7ed;border-left:3px solid #f97316;padding:6px 10px;margin:0 8px 8px;
        font-size:12.4px;border-radius:4px}
  .note{font-size:12.4px;color:#6b7280}
+ #provbox{font-size:12.2px;color:#4b5563}
+ #provbox h3{margin:0 0 6px;font-size:12.8px;color:#111}
+ #provbox code{background:#f1f5f9;padding:1px 5px;border-radius:4px}
+ #provbox .pw{color:#b45309;font-weight:600}
 </style></head><body>
 <header><h1>__TITLE__ <small>— generated __GEN__</small></h1></header>
 <main>
@@ -522,6 +535,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
  </div>
  <div class="bar" id="filters"></div>
  <div id="cards"></div>
+ <div class="panel" id="provbox"></div>
 </main>
 <script>
 const D=__DATA__, MODE="__MODE__";
@@ -655,6 +669,26 @@ const io=new IntersectionObserver(es=>es.forEach(e=>{
   {rootMargin:'300px'});
 document.querySelectorAll('.card').forEach(c=>io.observe(c));
 
+// ---- provenance footer: 'which result is this?' ----------------------------
+(function(){
+ const p=D.prov||{},b=document.getElementById('provbox');
+ if(!p.run_id){if(b)b.style.display='none';return;}
+ const g=p.git||{},ea=p.ea||{},ov=p.overrides||{};
+ const used=Object.entries(ov).filter(([k,v])=>v&&(!Array.isArray(v)||v.length))
+   .map(([k,v])=>`${k}=${Array.isArray(v)?v.join(' '):v}`);
+ b.innerHTML='<h3>Provenance</h3>'+
+  `<div>run <code>${p.run_id}</code> · generated ${p.generated} · `+
+  `analysis code <code>${g.commit||'n/a'}${g.dirty?' +dirty':''}</code> · python ${p.python||'?'}</div>`+
+  `<div>data cutoff <code>${p.data_cutoff||'n/a'}</code>`+
+  ((p.data_cutoffs_seen||[]).length>1?` <span class="pw">(MIXED: ${p.data_cutoffs_seen.join(', ')})</span>`:'')+
+  ` · source manifests written ${(p.source_manifest_written||['?','?']).join(' … ')}</div>`+
+  `<div>validated ${p.validated_passes||0} pass(es) · ${p.validation_mismatches||0} mismatch · `+
+  `${p.passes_missing_stats||0} without stats · ${p.passes_account_blown||0} account-blown</div>`+
+  `<div>EA ex5: ${Object.entries(ea).map(([k,v])=>`${k} <code>${(v.ex5_sha256_16||[]).join(', ')}</code>`).join(' · ')||'n/a'}</div>`+
+  (used.length?`<div class="pw">overrides: ${used.join(' · ')}</div>`:'<div>no overrides used</div>')+
+  ((D.prov_warnings||[]).length?`<div class="pw">${D.prov_warnings.map(w=>'&#9888; '+w).join('<br>')}</div>`:'');
+})();
+
 // ---- filters: one independent row per strategy ------------------------------
 const SORDER=['RR','GG'];
 const srank=x=>{const i=SORDER.indexOf(x);return i<0?99:i;};   // unknown -> last
@@ -727,6 +761,15 @@ def promote(S, tier, verdicts, dry_run):
         print(f"\nNothing to promote: no '{col}' column (no window had a {tier} pick).")
         return
     sel = S[S["verdict"].isin(verdicts) & S[col].notna()]
+    # Integrity gate: never promote data we could not verify or that we know is
+    # a partial sweep — the allocation downstream treats these DDs as hard limits.
+    if unsafe and not ARGS.allow_unvalidated:
+        m = sel.apply(lambda r: (r["strategy"], r["window"]) in unsafe, axis=1)
+        if m.any():
+            print("  BLOCKED (use --allow-unvalidated to override):")
+            for _, r in sel[m].iterrows():
+                print(f"    {r['strategy']} {r['window']:<7} {unsafe[(r['strategy'], r['window'])]}")
+            sel = sel[~m]
     if ARGS.exclude:
         excl = set(ARGS.exclude)
         m = sel.apply(lambda r: r["window"] in excl
@@ -790,6 +833,9 @@ ap.add_argument("--dry-run", action="store_true",
                 help="with --promote, show what would be copied and change nothing")
 ap.add_argument("--no-validate", action="store_true",
                 help="skip the cross-check of our figures against MT5's _stats.csv")
+ap.add_argument("--allow-unvalidated", action="store_true",
+                help="promote even from incomplete sweeps or windows with no "
+                     "MT5 _stats.csv (default: those are blocked)")
 ap.add_argument("--exclude", nargs="+", default=[],
                 help="windows to leave out of --promote, e.g. 6-7 or RR/6-7 "
                      "(bare window name applies to both strategies)")
@@ -805,13 +851,28 @@ if not sweep_dirs:
         "Run step 0 first, e.g.\n"
         "  python 0_run_mt5_sweeps.py --windows 11-12 --strategy GG --rr 0.5 3.0 0.1")
 
-summary, pages = [], []
+summary, pages, calib = [], [], []
+upstream = {}        # (strategy, window) -> its sweep _manifest.json
+unsafe = {}          # (strategy, window) -> why it must not be promoted
 val_bad, val_checked, val_missing, val_blown = [], 0, 0, 0
 for wdir in sweep_dirs:
     strat = os.path.basename(os.path.dirname(wdir))
     window = os.path.basename(wdir)
     stats_dir = os.path.join(SWEEPS_DIR, f"{strat}_stats", window)
     rows = []
+    n_missing_stats = 0
+    mf = os.path.join(wdir, "_manifest.json")
+    if os.path.isfile(mf):
+        try:
+            with open(mf, encoding="utf-8") as fh:
+                _m = json.load(fh)
+            upstream[(strat, window)] = _m
+            if _m.get("complete") is False:
+                unsafe[(strat, window)] = (
+                    f"sweep incomplete ({_m.get('files_collected')}/{_m.get('expected')} "
+                    f"files) — folder holds a MIX of runs")
+        except (OSError, ValueError):
+            pass
     for f in sorted(glob.glob(os.path.join(wdir, "*.csv"))):
         m = re.match(r"^.+_([0-9.]+)\.csv$", os.path.basename(f))
         if not m:
@@ -826,15 +887,23 @@ for wdir in sweep_dirs:
             bad, mt5_eq, blown = validate(strat, window, rr_val, df, stats_dir)
             if bad is None:
                 val_missing += 1
+                n_missing_stats += 1
             elif blown:
                 val_blown += 1
                 continue          # data incomplete AND the pass wiped the account
             else:
                 val_checked += 1
                 val_bad.extend(bad)
-        rows.append({"RR": rr_val, **metrics(df, mt5_eq)})
+        m = metrics(df, mt5_eq)
+        if m["dd_factor"] > 1.0:
+            calib.append({"strategy": strat, "window": window, "RR": rr_val,
+                          "dd_factor": m["dd_factor"]})
+        rows.append({"RR": rr_val, **m})
     if not rows:
         continue
+    if n_missing_stats and not ARGS.no_validate:
+        unsafe.setdefault((strat, window),
+                          f"{n_missing_stats} pass(es) have no MT5 _stats.csv — unverified")
     tbl = pd.DataFrame(rows).sort_values("RR").reset_index(drop=True)
     tbl = add_neighborhood(tbl)
     tiers = pick_tiers(tbl)
@@ -944,13 +1013,80 @@ if summary:
         if val_missing:
             print("  (windows without stats files were NOT verified — re-run step 0 "
                   "for them to close the gap)")
+    if unsafe:
+        print(f"\nIntegrity: {len(unsafe)} window(s) not promotable as-is")
+        for (st, w), why in sorted(unsafe.items()):
+            print(f"    {st} {w:<7} {why}")
+
+    # ---- provenance: what produced THIS set of recommendations ---------------
+    _eas, _cuts, _mruns, _mwritten = {}, set(), set(), []
+    for (st, w), m in upstream.items():
+        if m.get("ea"):
+            ex5 = (m["ea"].get("expert_ex5") or {}).get("sha256_16")
+            if ex5:
+                _eas.setdefault(st, set()).add(ex5)
+        if m.get("to"):
+            _cuts.add(str(m["to"]))
+        if m.get("run_id"):
+            _mruns.add(m["run_id"])
+        if m.get("written"):
+            _mwritten.append(str(m["written"]))
+    PROV = prov.base(
+        "1_select_rr",
+        data_cutoff=sorted(_cuts)[-1] if _cuts else None,
+        data_cutoffs_seen=sorted(_cuts),           # >1 means MIXED periods
+        source_manifest_runs=sorted(_mruns),
+        source_manifest_written=(min(_mwritten), max(_mwritten)) if _mwritten else None,
+        windows_scanned=len(sweep_dirs),
+        windows_without_manifest=len(sweep_dirs) - len(upstream),
+        validated_passes=val_checked,
+        validation_mismatches=len(val_bad),
+        passes_missing_stats=val_missing,
+        passes_account_blown=val_blown,
+        unsafe_windows={f"{a} {b}": why for (a, b), why in unsafe.items()},
+        ea={st: {"ex5_sha256_16": sorted(v)} for st, v in _eas.items()},
+        # manifests written before provenance tracking carry no EA identity —
+        # say so loudly rather than rendering a silent "n/a" downstream
+        ea_unknown_windows=sorted(f"{a} {b}" for (a, b), m in upstream.items()
+                                  if not (m.get("ea") or {}).get("expert_ex5")),
+        # only genuine deviations from the defaults belong here — listing the
+        # defaults as "overrides" would train you to ignore the field.
+        overrides={k: v for k, v in (
+            ("no_validate", bool(ARGS.no_validate)),
+            ("allow_unvalidated", bool(ARGS.allow_unvalidated)),
+            ("exclude", list(ARGS.exclude)),
+            ("verdicts", list(ARGS.verdicts) if list(ARGS.verdicts) != ["OK"] else []),
+        ) if v},
+        settings={"promote": ARGS.promote, "verdicts": list(ARGS.verdicts)},
+        thresholds={"MAX_DD_USD": MAX_DD_USD, "SMOOTH_RR": SMOOTH_RR,
+                    "MIN_RECOVERY": MIN_RECOVERY, "RECENT_YEARS": RECENT_YEARS,
+                    "FADING_SHARE": FADING_SHARE, "LR_MIN": LR_MIN,
+                    "TOP1_MAX_SHARE": TOP1_MAX_SHARE,
+                    "COMMISSION_PER_RT": COMMISSION_PER_RT},
+    )
+    prov.write(OUT_PROV, PROV)
+    print("\nProvenance: " + prov.summary_line(PROV))
+    if len(_cuts) > 1:
+        print(f"  !! sweeps span MORE THAN ONE data cutoff {sorted(_cuts)} — "
+              "windows are not comparable")
+    for _w in prov.warnings_for(PROV):
+        print("  !! " + _w)
+
+    # DD calibration for steps 2/3: without this the RR pick is cautious but the
+    # ACCOUNT drawdown constraint downstream stays optimistic on the same passes.
+    C = pd.DataFrame(calib, columns=["strategy", "window", "RR", "dd_factor"])
+    os.makedirs(os.path.dirname(OUT_CALIB), exist_ok=True)
+    C.to_csv(OUT_CALIB, index=False)
+    print(f"DD calibration: {len(C)} pass(es) need scaling "
+          f"(max x{C['dd_factor'].max():.3f}) -> {OUT_CALIB}"
+          if len(C) else f"DD calibration: none needed -> {OUT_CALIB}")
 
     # cards in trading-day order, not lexicographic ("1-2, 10-11, .. 2-3")
     _sord = {"RR": 0, "GG": 1}
     pages.sort(key=lambda p: (_sord.get(p["strat"], 9), p["strat"],
                               int(p["window"].split("-")[0])))
-    eq_html = write_html(S, pages, "equity", OUT_HTML)
-    sw_html = write_html(S, pages, "sweep", OUT_HTML_SWEEP)
+    eq_html = write_html(S, pages, "equity", OUT_HTML, PROV)
+    sw_html = write_html(S, pages, "sweep", OUT_HTML_SWEEP, PROV)
     if eq_html:
         n_conf = sum(1 for p in pages
                      if p["verdict"] != "LOSING" and p["shape"] and p["shape"] != "ALIVE")

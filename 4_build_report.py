@@ -24,6 +24,8 @@ import numpy as np
 import pandas as pd
 import plotly.offline as po
 
+import provenance as prov
+
 RES = "data/3_results"
 OUT_HTML = "reports/report.html"
 
@@ -130,8 +132,29 @@ if alloc is not None:
                   "s": f"worst account at {alloc['used_%_of_available'].max():.1f}% of its DD"})
 cards.append({"t": "Costs", "v": "$1 / round-turn", "s": "all figures net of commission"})
 
+PROV4 = prov.base("4_build_report",
+                  upstream=prov.load("data/3_results/_provenance_step3.json"))
+prov.write("data/3_results/_provenance_step4.json", PROV4)
+
+# flatten the chain so the page can show the whole lineage in one block
+_chain, _n = [], PROV4
+while _n:
+    _chain.append({k: _n.get(k) for k in
+                   ("step", "run_id", "generated", "git", "data_cutoff",
+                    "data_cutoffs_seen", "validated_passes",
+                    "validation_mismatches", "passes_missing_stats",
+                    "passes_account_blown", "overrides", "ea",
+                    "ea_unknown_windows", "unsafe_windows",
+                    "calibration_entries", "calibration_max", "report_fraction")})
+    _n = _n.get("upstream")
+_warn = []
+for _link in _chain:
+    _warn += prov.warnings_for(_link)
+
 data = {
     "generated": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+    "prov_chain": _chain,
+    "prov_warnings": sorted(set(_warn)),
     "cards": cards,
     "windows": wmeta,
     "trades": tr,
@@ -174,6 +197,11 @@ TEMPLATE = r"""<!DOCTYPE html>
  tr:hover td{background:#f8fafc}
  .twrap{max-height:420px;overflow:auto;border:1px solid #e5e7eb;border-radius:6px}
  .note{font-size:12.5px;color:#6b7280;margin:4px 0 10px}
+ #provbox{font-size:12.2px;color:#4b5563}
+ #provbox h2{margin:0 0 8px}
+ #provbox code{background:#f1f5f9;padding:1px 5px;border-radius:4px}
+ #provbox .pw{color:#b45309;font-weight:600}
+ #provbox table{font-size:12px;margin-top:6px;width:auto}
  .picker{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center;margin:2px 0 10px}
  .chip{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;
    border:1px solid #d7dbe0;border-radius:14px;padding:3px 10px;font-size:12.5px;background:#fff}
@@ -201,6 +229,7 @@ TEMPLATE = r"""<!DOCTYPE html>
    <span class="note">Charts: drag to zoom · double-click to reset · modebar (top-right)
    for pan / box-zoom / save-png. Equity and drawdown share an x-axis, so zooming one
    zooms the other.</span></div>
+  <div class="panel" id="provbox"></div>
  </section>
 
  <section id="tab1">
@@ -323,11 +352,16 @@ function compute(){
   e+=n; pk=Math.max(pk,e); mdd=Math.max(mdd,pk-e);
   ms.push(t); eq.push(Math.round(e*10)/10); dd.push(Math.round((e-pk)*10)/10);
   net.push(n); if(n>0)wins++;
-  const y=d.getFullYear(),m=d.getMonth();
+  // UTC getters ONLY. MT5 timestamps are naive broker time and were encoded as
+  // epoch-treated-as-UTC, so getUTC* round-trips the original clock exactly.
+  // getHours()/getDay() would re-interpret them in the VIEWER's timezone: on a
+  // GMT+2/+3 machine window "2-3" showed up as hour 4-5, and because the shift
+  // is DST-dependent it also moved trades across day/month boundaries.
+  const y=d.getUTCFullYear(),m=d.getUTCMonth();
   const mk=y+'-'+String(m+1).padStart(2,'0');
   mo[mk]=(mo[mk]||0)+n; yr[y]=(yr[y]||0)+n; sea[m]+=n;
-  hr[d.getHours()]+=n; cnt.hr[d.getHours()]++;
-  dw[d.getDay()]+=n;   cnt.dw[d.getDay()]++;
+  hr[d.getUTCHours()]+=n; cnt.hr[d.getUTCHours()]++;
+  dw[d.getUTCDay()]+=n;   cnt.dw[d.getUTCDay()]++;
  }
  return {ms,eq,dd,net,mo,yr,hr,dw,sea,cnt,mdd,wins,n:net.length,
          total:e,peak:pk};
@@ -370,7 +404,8 @@ function redraw(){
  Plotly.react('c_equity',traces,{
    margin:{l:66,r:16,t:34,b:34},font:FONT,hovermode:'x unified',dragmode:'zoom',
    title:{text:'Equity & drawdown of the selected windows',x:0,font:{size:13}},
-   xaxis:{domain:[0,1],anchor:'y2',showgrid:true,gridcolor:'#eef0f3',type:'date'},
+   xaxis:{domain:[0,1],anchor:'y2',showgrid:true,gridcolor:'#eef0f3',type:'date',
+         tickformatstops:[],hoverformat:'%Y-%m-%d'},
    yaxis:{domain:[.34,1],title:'equity $',gridcolor:'#eef0f3',zeroline:false},
    yaxis2:{domain:[0,.26],title:'DD $',gridcolor:'#eef0f3'},
    legend:{orientation:'h',y:-.12,font:{size:10}},
@@ -442,6 +477,31 @@ function redraw(){
    plot_bgcolor:'#fff',paper_bgcolor:'#fff'},CFG);
 }
 
+// ---- provenance: the lineage of THIS report --------------------------------
+(function(){
+ const box=document.getElementById('provbox');
+ const ch=DATA.prov_chain||[];
+ if(!box)return;
+ if(!ch.length){box.style.display='none';return;}
+ const head=ch[0],g=head.git||{};
+ const ov=[];
+ ch.forEach(l=>Object.entries(l.overrides||{}).forEach(([k,v])=>{
+   if(v&&(!Array.isArray(v)||v.length))ov.push(`${l.step}: ${k}=${Array.isArray(v)?v.join(' '):v}`);}));
+ const cut=ch.map(l=>l.data_cutoff).find(Boolean);
+ const val=ch.find(l=>l.validated_passes!=null)||{};
+ const cal=ch.find(l=>l.calibration_entries!=null)||{};
+ const ea=(ch.find(l=>l.ea&&Object.keys(l.ea).length)||{}).ea||{};
+ const rows=ch.map(l=>`<tr><td>${l.step||''}</td><td><code>${l.run_id||''}</code></td><td>${l.generated||''}</td></tr>`).join('');
+ box.innerHTML='<h2>Provenance</h2>'+
+  `<div>report run <code>${head.run_id}</code> · analysis code <code>${g.commit||'n/a'}${g.dirty?' +dirty':''}</code> · data cutoff <code>${cut||'n/a'}</code></div>`+
+  `<div>validated ${val.validated_passes||0} pass(es) · ${val.validation_mismatches||0} mismatch · ${val.passes_missing_stats||0} without MT5 stats</div>`+
+  `<div>DD calibration: ${cal.calibration_entries||0} pass(es) scaled, max &times;${Number(cal.calibration_max||1).toFixed(3)}</div>`+
+  `<div>EA ex5: ${Object.entries(ea).map(([k,v])=>`${k} <code>${(v.ex5_sha256_16||[]).join(', ')}</code>`).join(' · ')||'n/a'}</div>`+
+  (ov.length?`<div class="pw">overrides: ${ov.join(' · ')}</div>`:'<div>no overrides used</div>')+
+  ((DATA.prov_warnings||[]).length?`<div class="pw">${DATA.prov_warnings.map(w=>'&#9888; '+w).join('<br>')}</div>`:'')+
+  `<table><thead><tr><th>step</th><th>run id</th><th>generated</th></tr></thead><tbody>${rows}</tbody></table>`;
+})();
+
 // ---- step 3 accounts --------------------------------------------------------
 function drawAccounts(){
  const tr=DATA.accounts.map(a=>{
@@ -452,7 +512,8 @@ function drawAccounts(){
  Plotly.react('c_accounts',tr,{margin:{l:66,r:16,t:34,b:34},font:FONT,
    title:{text:'Per-account equity (one-position replay)',x:0,font:{size:13}},
    hovermode:'x unified',dragmode:'zoom',
-   xaxis:{gridcolor:'#eef0f3',type:'date'},yaxis:{title:'equity $',gridcolor:'#eef0f3'},
+   xaxis:{gridcolor:'#eef0f3',type:'date',hoverformat:'%Y-%m-%d'},
+   yaxis:{title:'equity $',gridcolor:'#eef0f3'},
    legend:{orientation:'h',y:-.14,font:{size:10}},
    plot_bgcolor:'#fff',paper_bgcolor:'#fff'},CFG);
 }
