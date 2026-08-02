@@ -485,9 +485,21 @@ _TEMPLATE = r"""<!DOCTYPE html>
  .btn{border:1px solid #d7dbe0;background:#fff;border-radius:6px;padding:4px 10px;
       cursor:pointer;font-size:12.5px}
  .btn:hover{background:#f1f5f9} .btn.on{background:#1f2937;color:#fff;border-color:#1f2937}
+ .btn.empty{opacity:.4}
+ .rowlab{font-weight:700;font-size:12.5px;min-width:26px;color:#374151}
+ .sep{display:inline-block;width:1px;height:18px;background:#e5e7eb;margin:0 4px}
+ #filters{background:#fff;border-radius:10px;padding:8px 12px;margin-bottom:14px;
+          box-shadow:0 1px 3px rgba(0,0,0,.08)}
+ #filters .bar{margin:0;padding:3px 0}
  .card{background:#fff;border-radius:10px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,.08);
-       overflow:hidden}
+       overflow:hidden;border-left:4px solid #d1d5db}
  .card.hide{display:none}
+ .card.strat-0{border-left-color:#3b82f6;background:#fafcff}
+ .card.strat-1{border-left-color:#f97316;background:#fffaf5}
+ .stratdiv{display:flex;align-items:center;gap:10px;margin:20px 0 10px;
+           font-size:13px;font-weight:700;color:#374151}
+ .stratdiv::after{content:'';flex:1;height:1px;background:#e5e7eb}
+ .stratdiv .dot{width:10px;height:10px;border-radius:50%}
  .chead{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:baseline;padding:10px 14px;
         border-bottom:1px solid #eef0f3;font-size:12.8px}
  .chead b{font-size:14.5px}
@@ -552,8 +564,21 @@ document.getElementById('legend').innerHTML =
 
 // ---- cards ----
 const wrap=document.getElementById('cards');
+const CSORDER=['RR','GG'];
+const csrank=x=>{const i=CSORDER.indexOf(x);return i<0?99:i;};
+let lastStrat=null;
+const stratDivs={};
 D.pages.forEach((p,i)=>{
- const d=document.createElement('div');d.className='card';d.dataset.i=i;
+ if(p.strat!==lastStrat){
+   lastStrat=p.strat;
+   const n=D.pages.filter(q=>q.strat===p.strat).length;
+   const div=document.createElement('div');div.className='stratdiv';
+   div.innerHTML=`<span class="dot" style="background:${csrank(p.strat)===0?'#3b82f6':'#f97316'}"></span>${p.strat} <span style="font-weight:400;color:#9ca3af">(${n} windows)</span>`;
+   wrap.appendChild(div);
+   stratDivs[p.strat]=div;
+ }
+ const d=document.createElement('div');
+ d.className='card strat-'+csrank(p.strat);d.dataset.i=i;
  const t=p.tiers.recommended||p.tiers.unlocked||{};
  d.innerHTML=`<div class="chead">
    <b>${p.strat} ${p.window}</b>
@@ -630,28 +655,62 @@ const io=new IntersectionObserver(es=>es.forEach(e=>{
   {rootMargin:'300px'});
 document.querySelectorAll('.card').forEach(c=>io.observe(c));
 
-// ---- filters ----
-const F=[['all','All',()=>true],
-         ['conflict','Conflicts only',p=>conflict(p)],
-         ['ok','OK',p=>p.verdict==='OK'],
-         ['weak','WEAK',p=>p.verdict==='WEAK'],
-         ['unlock','UNLOCK_ONLY',p=>p.verdict==='UNLOCK_ONLY'],
-         ['rr','RR only',p=>p.strat==='RR'],
-         ['gg','GG only',p=>p.strat==='GG']];
+// ---- filters: one independent row per strategy ------------------------------
+const SORDER=['RR','GG'];
+const srank=x=>{const i=SORDER.indexOf(x);return i<0?99:i;};   // unknown -> last
+const STRATS=[...new Set(D.pages.map(p=>p.strat))].sort((a,b)=>srank(a)-srank(b));
+const DEFS=[['All',()=>true,'sep'],
+            ['OK',p=>p.verdict==='OK'],
+            ['WEAK',p=>p.verdict==='WEAK'],
+            ['UNLOCK_ONLY',p=>p.verdict==='UNLOCK_ONLY'],
+            ['LOSING',p=>p.verdict==='LOSING','sep'],
+            ['ALIVE',p=>p.shape==='ALIVE'],
+            ['CONCENTRATED',p=>p.shape==='CONCENTRATED'],
+            ['ERRATIC',p=>p.shape==='ERRATIC'],
+            ['FADING',p=>p.shape==='FADING'],
+            ['STALE',p=>p.shape==='STALE','sep'],
+            ['Conflicts only',p=>conflict(p)],
+            ['Hide',()=>false]];
+const state={};                       // strategy -> predicate
+STRATS.forEach(st=>state[st]=()=>true);
+
+function apply(){
+ const anyVisible={};
+ document.querySelectorAll('.card').forEach(c=>{
+   const p=D.pages[+c.dataset.i];
+   const show=(state[p.strat]||(()=>true))(p);
+   c.classList.toggle('hide',!show);
+   if(show){render(+c.dataset.i);anyVisible[p.strat]=true;}
+ });
+ Object.keys(stratDivs).forEach(st=>
+   stratDivs[st].style.display=anyVisible[st]?'':'none');
+ window.dispatchEvent(new Event('resize'));
+}
+
 const fb=document.getElementById('filters');
-F.forEach(([id,label,fn],k)=>{
- const b=document.createElement('button');b.className='btn'+(k===0?' on':'');b.textContent=label;
- b.onclick=()=>{fb.querySelectorAll('.btn').forEach(x=>x.classList.remove('on'));b.classList.add('on');
-   document.querySelectorAll('.card').forEach(c=>{
-     const p=D.pages[+c.dataset.i];
-     const show=fn(p);c.classList.toggle('hide',!show);
-     if(show)render(+c.dataset.i);});
-   window.dispatchEvent(new Event('resize'));};
- fb.appendChild(b);});
-const nc=D.pages.filter(conflict).length;
-const cnt=document.createElement('span');cnt.className='note';
-cnt.style.marginLeft='8px';cnt.textContent=`${D.pages.length} windows · ${nc} conflict${nc===1?'':'s'}`;
-fb.appendChild(cnt);
+STRATS.forEach(st=>{
+ const mine=D.pages.filter(p=>p.strat===st);
+ const nc=mine.filter(conflict).length;
+ const row=document.createElement('div');row.className='bar';
+ const lab=document.createElement('span');lab.className='rowlab';lab.textContent=st;
+ row.appendChild(lab);
+ DEFS.forEach(([label,fn,sep],k)=>{
+  const b=document.createElement('button');
+  b.className='btn'+(k===0?' on':'');b.textContent=label;
+  const n=mine.filter(fn).length;
+  b.title=`${n} window${n===1?'':'s'}`;
+  if(n===0&&label!=='Hide')b.classList.add('empty');
+  b.onclick=()=>{row.querySelectorAll('.btn').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on');state[st]=fn;apply();};
+  row.appendChild(b);
+  if(sep){const d=document.createElement('span');d.className='sep';row.appendChild(d);}
+ });
+ const cnt=document.createElement('span');cnt.className='note';
+ cnt.style.marginLeft='auto';
+ cnt.textContent=`${mine.length} windows · ${nc} conflict${nc===1?'':'s'}`;
+ row.appendChild(cnt);
+ fb.appendChild(row);
+});
 </script></body></html>"""
 
 
@@ -886,6 +945,10 @@ if summary:
             print("  (windows without stats files were NOT verified — re-run step 0 "
                   "for them to close the gap)")
 
+    # cards in trading-day order, not lexicographic ("1-2, 10-11, .. 2-3")
+    _sord = {"RR": 0, "GG": 1}
+    pages.sort(key=lambda p: (_sord.get(p["strat"], 9), p["strat"],
+                              int(p["window"].split("-")[0])))
     eq_html = write_html(S, pages, "equity", OUT_HTML)
     sw_html = write_html(S, pages, "sweep", OUT_HTML_SWEEP)
     if eq_html:
