@@ -194,3 +194,36 @@ Decide this **before** running, so the result cannot be rationalised afterwards:
 Falling short of these is informative, not a failure of the project — it would
 mean the honest conclusion is "trade fewer windows with simpler rules", which is
 a real and useful result.
+
+---
+
+## 10. FIRST RESULTS (2026-08-04, run via 5_walkforward.py)
+
+| Fold | test | OOS net | worst acct % of limit | baseline (all windows @1.5) |
+|---|---|---|---|---|
+| 1 | 2023 | $2,511 | 97.4% | $21,903 |
+| 2 | 2024 | $4,178 | 87.4% | $20,714 |
+| 3 | 2025 | $7,200 | **165.2% — BLOWN** | $26,498 |
+| 4 | 2026H1 | $13,750 | **138.7% — BLOWN** | $5,486 |
+
+Summary: WFE 0.787 (pass), 4/4 folds OOS-positive (pass),
+**beats_baseline FALSE** ($27,639 vs $74,601), **any_acct_over_limit TRUE**.
+Verdict vs pre-registered bar (§9): **2 of 4 criteria FAILED.**
+
+Nuances:
+- Baseline is not risk-comparable (46 windows, no caps/blocking). Per-window:
+  baseline ≈ $1.6k/window OOS vs selection ≈ $1.7k/window — parity. So the RR
+  optimisation layer adds ~nothing per window over fixed RR 1.5; the baseline's
+  edge is BREADTH. Diversification >> per-window RR tuning.
+- The real failure is SURVIVAL: an in-sample 85% cap produced OOS account DD of
+  165% and 139% of limit in 2025/2026. In-sample DD understates next-year DD by
+  up to ~2x. The cap must assume that (e.g. cap ~50%, or size DD budgets on
+  OOS-measured DD, not in-sample DD).
+
+Implications to explore next (new chat):
+1. Re-run allocation with CAP_FRACTION ~0.45-0.55 and check OOS survival.
+2. Test "many windows at moderate fixed RR" as the actual strategy — it may
+   dominate the tuned version at equal risk once caps/blocking are applied to
+   the baseline too (build a risk-matched baseline).
+3. RR-stability per window across folds (already in walkforward_folds.csv picks
+   column) — drop windows whose RR swings wildly.
