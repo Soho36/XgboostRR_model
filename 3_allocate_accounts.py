@@ -42,15 +42,14 @@ TRADE_FILES = {
 OUT_CSV = "data/3_results/multi_strategy_allocation.csv"
 
 ACCOUNT_NAMES = [
-    "PA-08-1500",
     "PA-09-1500",
     "PA-10-1500",
-    "PA-11-1500",
     "PA-12-2000",
     "PA-13-2000",
     "PA-14-2000",
+    "PA-15-2500",
 ]
-ACCOUNT_LIMITS = [1500.0] * 4 + [2000.0] * 3
+ACCOUNT_LIMITS = [1500.0] * 2 + [2000.0] * 3 + [2500.0] * 1
 
 # Override this when an account has already used some trailing DD. The cap
 # frontier is applied to this available amount, not blindly to the nominal limit.

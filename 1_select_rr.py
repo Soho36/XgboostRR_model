@@ -25,8 +25,8 @@ OUTPUT:
     data/2_chosen/<STRAT>/  (with --promote)
 
 USAGE
-venv/Scripts/python.exe 1_select_rr.py --promote recommended --dry-run   # preview
-venv/Scripts/python.exe 1_select_rr.py --promote recommended             # do it
+python 1_select_rr.py --promote recommended --dry-run   # preview
+python 1_select_rr.py --promote recommended             # do it
 """
 
 import argparse

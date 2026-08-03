@@ -44,6 +44,38 @@ stage and writes the next:
 | `run/mt5_ini/` | generated tester configs (transient) | 0 | MT5 |
 | `legacy/` | retired optimization-XML path | — | — |
 
+## Running it
+
+Use the runner — it cleans before it builds, so `data/3_results/` and
+`reports/` can never hold a mix of vintages:
+
+```bash
+python run_pipeline.py            # steps 1-4 (sweeps skipped), clean first
+python run_pipeline.py --status   # is what's on disk current and consistent?
+python run_pipeline.py --dry-run  # show what would be deleted and run
+python run_pipeline.py --from 2   # only steps 2-4 (e.g. after editing accounts)
+```
+
+**Step 0 is excluded by default** — hours of MT5 work, and it's data collection
+rather than analysis. `data/1_sweeps/` is never auto-cleaned. Include it only
+deliberately:
+
+```bash
+python run_pipeline.py --with-sweeps --windows 2-3 3-4 --strategy RR --rr 0.5 3.0 0.1
+```
+
+Why a runner rather than running scripts by hand: stopping halfway leaves
+`data/3_results/` holding some files from today's step 1 and some from last
+week's step 3, with nothing on disk saying which is which — and file
+timestamps *can't* tell you, because `promote()` copies preserve the source
+file's mtime by design. The runner deletes each step's artefacts before that
+step re-runs, and on failure it stops, leaving the later stages **empty**
+(honestly "not produced") rather than stale (misleadingly "looks produced").
+
+`--status` answers "is this current?" by walking the provenance chain: each
+step embeds the record of the step before it, so a run-id mismatch means that
+artefact was built against a different upstream.
+
 ## Pipeline
 
 ```bash
