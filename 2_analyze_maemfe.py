@@ -173,7 +173,12 @@ def save_csv(df, path):
     try:
         df.to_csv(path, index=False)
         return path
-    except PermissionError:
+    except PermissionError as e:
+        if os.environ.get("PIPELINE_RUN") == "1":
+            raise RuntimeError(
+                f"{path} is locked. Pipeline runs require the canonical output; "
+                "close the program holding it and rerun."
+            ) from e
         import time
         alt = path.replace(".csv", f"_{time.strftime('%H%M%S')}.csv")
         df.to_csv(alt, index=False)

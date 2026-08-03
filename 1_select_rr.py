@@ -1004,7 +1004,12 @@ if summary:
     try:
         S.to_csv(OUT_CSV, index=False)
         print(f"\nSaved {OUT_CSV}")
-    except PermissionError:
+    except PermissionError as e:
+        if os.environ.get("PIPELINE_RUN") == "1":
+            raise RuntimeError(
+                f"{OUT_CSV} is locked. Pipeline runs require the canonical output; "
+                "close the program holding it and rerun."
+            ) from e
         import time
         alt = OUT_CSV.replace(".csv", f"_{time.strftime('%H%M%S')}.csv")
         S.to_csv(alt, index=False)

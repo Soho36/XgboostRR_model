@@ -13,6 +13,9 @@ preserve the SOURCE file's mtime by design.
 This runner:
   * DELETES every artefact of the steps it is about to run, before running them,
     so a stale file can never survive into a new run;
+  * ABORTS if any owned artefact cannot be removed (for example because Excel
+    has it open).  A pipeline run never falls back to timestamped filenames:
+    its downstream steps must consume the canonical files from this run;
   * runs the steps in order and stops at the first failure — leaving the
     already-cleaned later stages EMPTY rather than stale, which is the honest
     state ("not produced yet") instead of a misleading one ("looks produced");
@@ -50,6 +53,10 @@ REPORTS = "reports"
 CHOSEN = "data/2_chosen"
 PIPELINE_JSON = os.path.join(RESULTS, "_pipeline.json")
 
+
+class CleanupError(RuntimeError):
+    """An old artefact could not be removed, so a clean run is impossible."""
+
 # What each step OWNS. Anything listed here is deleted before that step re-runs,
 # so the folder can only ever contain output from the current run.
 # `data/1_sweeps/` is deliberately absent — that is step 0's expensive output.
@@ -64,7 +71,8 @@ STEPS = {
         "name": "RR selection + promote",
         "owns": [
             f"{CHOSEN}/*/*.csv",
-            f"{RESULTS}/rr_pertrade_recommendations.csv",
+            # Also remove timestamped fallbacks from older manual runs.
+            f"{RESULTS}/rr_pertrade_recommendations*.csv",
             f"{RESULTS}/dd_calibration.csv",
             f"{RESULTS}/_provenance_step1.json",
             f"{REPORTS}/step1_rr_selection.html",
@@ -76,8 +84,8 @@ STEPS = {
         "script": "2_analyze_maemfe.py",
         "name": "portfolio analysis",
         "owns": [
-            f"{RESULTS}/*_maemfe_window_summary.csv",
-            f"{RESULTS}/*_maemfe_combined_trades.csv",
+            f"{RESULTS}/*_maemfe_window_summary*.csv",
+            f"{RESULTS}/*_maemfe_combined_trades*.csv",
             f"{RESULTS}/_provenance_step2.json",
             f"{REPORTS}/plots/step2_portfolio",
         ],
@@ -86,7 +94,7 @@ STEPS = {
         "script": "3_allocate_accounts.py",
         "name": "account allocation",
         "owns": [
-            f"{RESULTS}/multi_strategy_allocation.csv",
+            f"{RESULTS}/multi_strategy_allocation*.csv",
             f"{RESULTS}/_provenance_step3.json",
             f"{REPORTS}/plots/step3_allocation",
         ],
@@ -115,12 +123,23 @@ def clean(step, dry_run):
     if not targets:
         return 0
     label = "would delete" if dry_run else "deleted"
+    failures = []
     for t in targets:
         if not dry_run:
             try:
                 shutil.rmtree(t) if os.path.isdir(t) else os.remove(t)
             except OSError as e:
                 print(f"      ! could not delete {t}: {e}")
+                failures.append((t, e))
+    if failures:
+        removed = len(targets) - len(failures)
+        print(f"    cleanup incomplete: {removed} item(s) {label}, "
+              f"{len(failures)} could not be removed")
+        names = ", ".join(t for t, _ in failures)
+        raise CleanupError(
+            "Cannot start a clean pipeline run: close any program holding "
+            f"these artefacts, then rerun: {names}"
+        )
     print(f"    {label} {len(targets)} item(s)")
     return len(targets)
 
@@ -132,7 +151,10 @@ def run(step, extra_args, dry_run):
     if dry_run:
         print("  (dry run — not executed)")
         return True, 0.0
-    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    # The standalone scripts retain their convenient timestamped fallback for
+    # ad-hoc/manual use.  In a pipeline that would make downstream consumers
+    # read an old canonical file, so require canonical output instead.
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", PIPELINE_RUN="1")
     t0 = time.time()
     rc = subprocess.run(cmd, env=env).returncode
     dt = time.time() - t0
@@ -236,12 +258,16 @@ def main():
     # means a mid-pipeline failure leaves later stages empty (honest) rather
     # than holding output from a previous run (misleading).
     print("\nCleaning artefacts of the steps about to run:")
-    for n in steps:
-        if STEPS[n]["owns"]:
-            print(f"  step {n} ({STEPS[n]['name']}):")
-            clean(n, a.dry_run)
-        else:
-            print(f"  step {n} ({STEPS[n]['name']}): nothing auto-cleaned (expensive)")
+    try:
+        for n in steps:
+            if STEPS[n]["owns"]:
+                print(f"  step {n} ({STEPS[n]['name']}):")
+                clean(n, a.dry_run)
+            else:
+                print(f"  step {n} ({STEPS[n]['name']}): nothing auto-cleaned (expensive)")
+    except CleanupError as e:
+        print(f"\n!! CLEANUP FAILED — no pipeline steps were started.\n   {e}")
+        sys.exit(1)
 
     results, failed_at = {}, None
     for n in steps:

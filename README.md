@@ -71,6 +71,10 @@ timestamps *can't* tell you, because `promote()` copies preserve the source
 file's mtime by design. The runner deletes each step's artefacts before that
 step re-runs, and on failure it stops, leaving the later stages **empty**
 (honestly "not produced") rather than stale (misleadingly "looks produced").
+If an old output is open in Excel or another program, cleanup fails before any
+step begins; close it and rerun. Pipeline runs require each step to write its
+canonical filename, never a timestamped fallback that a downstream step could
+mistake for current output.
 
 `--status` answers "is this current?" by walking the provenance chain: each
 step embeds the record of the step before it, so a run-id mismatch means that
