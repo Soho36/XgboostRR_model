@@ -1,7 +1,7 @@
 # Forward / Out-of-Sample Testing — Plan
 
-Status: **design agreed, not yet implemented.** Written 2026-08-03 so the plan
-survives beyond the chat it was designed in.
+Status: **implemented; corrected re-run required.** Written 2026-08-03 so the
+plan survives beyond the chat it was designed in.
 
 ---
 
@@ -111,17 +111,22 @@ WFE = (annualised OOS net profit) / (annualised in-sample net profit)
 - Verdict churn: how often a window flips OK ↔ WEAK ↔ UNLOCK_ONLY across folds
 - OOS shape flags (`CONCENTRATED` / `STALE`) computed on test data only
 
-**A deliberately included baseline:** compare against "trade every window at one
-fixed RR" (e.g. 1.5). If the elaborate per-window selection cannot beat a single
-global RR out-of-sample, the selection machinery is not earning its complexity.
-This is the single most important control in the whole exercise.
+**A deliberately included baseline:** give every candidate window one fixed RR
+(e.g. 1.5), then run the **same fit-period allocator, account cap, and
+one-position replay** as the selected model. If the elaborate per-window
+selection cannot beat that risk-matched control out-of-sample, the selection
+machinery is not earning its complexity. A raw "trade all windows" total is a
+useful breadth illustration, but never a pass/fail comparison.
 
 ---
 
 ## 6. What to build — `5_walkforward.py`
 
-Reuses existing logic rather than reimplementing it (same DD maths, same tier
-selection, same ILP), so the thing being tested is the *actual* pipeline.
+Mirrors the production constraints rather than importing scripts that execute
+at import time. The fold uses the conservative MFE-first MAE/MFE drawdown bound
+for risk caps: full-period MT5 stats cannot calibrate an earlier fold without
+leaking its test period. Every selected pass is checked fail-closed against its
+MT5 stats so a tester-truncated export cannot manufacture an OOS result.
 
 ```
 for each fold:
@@ -197,7 +202,13 @@ a real and useful result.
 
 ---
 
-## 10. FIRST RESULTS (2026-08-04, run via 5_walkforward.py)
+## 10. Pre-correction result — superseded
+
+The result below was produced before the walk-forward implementation corrected
+its replayed stitched curve, production allocation constraints, risk-matched
+baseline, input-integrity gates, source cutoff handling, and non-leaking risk
+bound. **Do not use these numeric values to make a trading decision.** It is
+kept only as an audit record; the next successful corrected run is authoritative.
 
 | Fold | test | OOS net | worst acct % of limit | baseline (all windows @1.5) |
 |---|---|---|---|---|
@@ -227,3 +238,20 @@ Implications to explore next (new chat):
    the baseline too (build a risk-matched baseline).
 3. RR-stability per window across folds (already in walkforward_folds.csv picks
    column) — drop windows whose RR swings wildly.
+
+## 11. CORRECTED RESULTS (2026-08-04, risk-matched control + breach analysis)
+
+| Fold | test | OOS | worst% | risk-matched fixed-RR |
+|---|---|---|---|---|
+| 1 | 2023 | $3,156 | 97.4% | $4,632 |
+| 2 | 2024 | $4,162 | 115.0% | $5,920 |
+| 3 | 2025 | $8,420 | 153.9% | $7,567 |
+| 4 | 2026H1 | $13,336 | 84.5% | $13,948 |
+
+WFE 0.81 · 4/4 positive · selection $29,074 vs control $32,067 -> **selection
+still loses even risk-matched** (per-window RR tuning adds ~nothing; simpler is
+better). Survival still fails (2 folds breach). PROP-REALITY: 4 of 24
+account-folds breached; post-breach profit $3,834 means as-scored OOS is
+FLATTERED, not dragged down, by blown accounts — termination-adjusted OOS =
+$25,240 (+4 eval/reset fees). So the modest OOS number is performance+risk,
+NOT an artefact of blown accounts sitting out. reports/walkforward.html built.
