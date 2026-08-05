@@ -44,6 +44,7 @@ OUT: data/3_results/farming_starts.csv    one row per possible start date
 
 import argparse
 import importlib
+import json
 import os
 
 import numpy as np
@@ -158,6 +159,246 @@ def run_portfolio(ex, net, mae, mfe, n_live, keep, gap_days):
     return C, bought, deaths, equity_left, len(live)
 
 
+def run_book(ex, net, mae, mfe, keep, max_live, seed_cash, per_month,
+             reinvest, adaptive):
+    """A BOOK of accounts where withdrawn cash buys more accounts.
+
+    This is the mechanic the first version missed: at ACCOUNT_COST a seat, a
+    $500 withdrawal is 2.5 new accounts. Harvesting is therefore not only a
+    safety-for-cash trade — it is the only way to fund growth. An account that
+    dies having paid for three replacements was a good account.
+
+    adaptive=True harvests hard (down to the Safety Net) while the book is still
+    growing, then switches to `keep` once the seat limit is reached and extra
+    cash no longer buys anything.
+    """
+    cash, live, bought, deaths, withdrawn = seed_cash, [], 0, 0, 0.0
+    last_month, series, ruin_i = None, [], None
+    for i in range(len(net)):
+        day = pd.Timestamp(ex[i])
+        if (day.year, day.month) != last_month:
+            last_month = (day.year, day.month)
+            want = int(cash // ACCOUNT_COST) if reinvest else per_month
+            for _ in range(max(0, min(want, max_live - len(live),
+                                      int(cash // ACCOUNT_COST)))):
+                live.append(new_account(i))
+                cash -= ACCOUNT_COST
+                bought += 1
+        k = SAFETY_NET if (adaptive and len(live) < max_live) else keep
+        got = sum(step(a, net[i], mae[i], mfe[i], k) for a in live)
+        cash += got
+        withdrawn += got
+        n0 = len(live)
+        live = [a for a in live if a["alive"]]
+        deaths += n0 - len(live)
+        # absorbing state: no seats left and not enough cash to buy one back
+        if ruin_i is None and not live and cash < ACCOUNT_COST:
+            ruin_i = i
+        series.append((day, len(live), withdrawn, cash))
+    equity = sum(a["eq"] for a in live)
+    S = pd.DataFrame(series, columns=["day", "live", "withdrawn", "cash"])
+    return {"series": S, "bought": bought, "deaths": deaths, "cash": cash,
+            "equity": equity, "withdrawn": withdrawn, "live": len(live),
+            "ruined": ruin_i is not None,
+            "wealth": cash + equity - seed_cash}
+
+
+def trace_account(ex, net, mae, mfe, i0, keep):
+    """Full path of one account: equity, the moving floor, and the Safety Net."""
+    a = new_account(i0)
+    path = []
+    for i in range(i0, len(net)):
+        step(a, net[i], mae[i], mfe[i], keep)
+        path.append((pd.Timestamp(ex[i]), a["eq"] + a["banked"], a["eq"],
+                     a["floor"], a["frozen"]))
+        if not a["alive"]:
+            break
+    return path
+
+
+_TPL = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Prop-account farming</title>
+<script>__PLOTLYJS__</script>
+<style>
+ body{font:14px/1.45 system-ui,Segoe UI,Arial;margin:0;background:#f4f5f7;color:#1a1a1a}
+ header{background:#1f2937;color:#fff;padding:14px 22px}h1{font-size:17px;margin:0}
+ header p{margin:4px 0 0;font-size:12.5px;color:#cbd5e1}
+ main{max-width:1240px;margin:16px auto;padding:0 16px}
+ .cards{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px}
+ .card{background:#fff;border-radius:10px;padding:12px 18px;box-shadow:0 1px 3px rgba(0,0,0,.08);min-width:165px;flex:1}
+ .card .t{font-size:11.5px;color:#6b7280;text-transform:uppercase}
+ .card .v{font-size:21px;font-weight:600}.card .v.ok{color:#15803d}.card .v.bad{color:#b91c1c}
+ .card .s{font-size:11.5px;color:#6b7280}
+ .panel{background:#fff;border-radius:10px;padding:12px 14px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+ table{border-collapse:collapse;width:100%;font-size:12.4px}
+ th{text-align:right;padding:5px 8px;background:#f1f5f9;white-space:nowrap}
+ th:first-child,td:first-child{text-align:left}
+ td{padding:4px 8px;text-align:right;border-top:1px solid #eef0f3;white-space:nowrap}
+ .note{font-size:12.3px;color:#6b7280;margin:6px 0}
+ h2{font-size:15px;margin:18px 0 8px}
+ .warn{background:#fef3c7;border-left:3px solid #d97706;padding:10px 14px;border-radius:6px;font-size:12.8px;margin-bottom:16px}
+ .warn b{color:#92400e}
+</style></head><body>
+<header><h1>Prop-account farming &mdash; buy seats, harvest the survivors</h1>
+<p>RR strategy, every window, RR __RRV__, $__DDV__ trailing drawdown, $__COSTV__ per seat.</p>
+</header><main>
+<div class="cards" id="cards"></div>
+<div class="warn"><b>This is leverage, not alpha.</b> Every seat trades identical
+signals and differs only by start date. N seats is N contracts, and a drawdown deep
+enough to kill one is deep enough to kill the book. The totals below scale with seat
+count; the per-seat figures are what actually measure the strategy.</div>
+
+<h2>1 &middot; How a seat lives and dies</h2>
+<div class="panel"><div id="c_life" style="height:400px"></div>
+ <div class="note">The floor chases the peak upward until peak profit reaches the Safety
+ Net, then freezes at +$100 forever. Everything after that point is cushion. Withdrawing
+ cash lowers equity toward that frozen floor &mdash; which is why harvesting kills seats.</div></div>
+
+<h2>2 &middot; Does a seat reach the Safety Net? By start date</h2>
+<div class="panel"><div id="c_starts" style="height:380px"></div>
+ <div class="note">Green = reached the Safety Net, plotted at the number of days it took.
+ Red = died first. The red clusters are what matters: seats started near each other share
+ one fate, so staggering spreads entry points, not outcomes.</div></div>
+
+<h2>3 &middot; The withdrawal question</h2>
+<div class="panel"><div id="c_keep" style="height:440px"></div>
+ <div class="note">Withdrawn cash buys more seats, so harvesting is not only a
+ safety-for-cash trade &mdash; it is the only way to fund growth. "never" withdraw can
+ never afford a second seat. Bars are the MEDIAN realized cash across every
+ __NWIN__ overlapping __HZV__-year window; whiskers are p10 to p90. Read the whisker,
+ not the bar: the spread is wider than the difference between policies.</div></div>
+
+<h2>4 &middot; The book over time</h2>
+<div class="panel"><div id="c_book" style="height:400px"></div>
+ <div class="note">Seats live (filled) against cumulative cash withdrawn. Every step down
+ in seat count is a liquidation.</div></div>
+<div class="panel"><div id="c_year" style="height:320px"></div>
+ <div class="note">Cash per calendar year, from the same single book as the chart above.
+ The spread between the best and worst year is the risk this design carries, and it is
+ not smoothed by holding more seats, because the seats are not independent.</div></div>
+
+<h2>5 &middot; Every withdrawal policy, across all windows</h2>
+<div class="panel" style="overflow:auto" id="t_keep"></div>
+<div class="note">Cash is realized. Equity is still inside live accounts and can be lost
+&mdash; never add the two together and call it profit.</div>
+<h2>6 &middot; The same policies as a single run &mdash; why not to trust them</h2>
+<div class="warn"><b>These are one path each.</b> Bootstrapping from a small seed has an
+absorbing state: lose every seat with less than one seat's price in cash and the book is
+over permanently. That makes the process chaotic &mdash; below, adjacent withdrawal levels
+differ by orders of magnitude. This table is here to show the instability, not to be
+read as a result.</div>
+<div class="panel" style="overflow:auto" id="t_single"></div>
+<h2>6 &middot; Reconstruction check</h2>
+<div class="panel" style="overflow:auto" id="t_rec"></div>
+<div class="note" id="foot"></div>
+</main><script>
+const D=__DATA__,CFG={displaylogo:false,responsive:true};
+const F={family:'system-ui,Segoe UI,Arial',size:11.5};
+const $=v=>(v<0?'-$':'$')+Math.abs(Math.round(v)).toLocaleString();
+document.getElementById('cards').innerHTML=D.cards.map(c=>
+ `<div class="card"><div class="t">${c[0]}</div><div class="v ${c[2]||''}">${c[1]}</div>
+  <div class="s">${c[3]||''}</div></div>`).join('');
+Plotly.newPlot('c_life',[
+ {x:D.life.x,y:D.life.eq,type:'scatter',mode:'lines',name:'equity in the account',
+  line:{width:1.8,color:'#111'}},
+ {x:D.life.x,y:D.life.fl,type:'scatter',mode:'lines',name:'liquidation floor',
+  line:{width:1.6,color:'#e15759',shape:'hv'}},
+ {x:D.life.x,y:D.life.tot,type:'scatter',mode:'lines',name:'equity + cash taken out',
+  line:{width:1.4,color:'#4e79a7',dash:'dot'}}],
+ {margin:{l:66,r:14,t:28,b:34},font:F,hovermode:'x unified',
+  title:{text:'One seat, from purchase to liquidation',x:0,font:{size:13}},
+  shapes:[{type:'line',xref:'paper',x0:0,x1:1,y0:D.safety,y1:D.safety,
+   line:{color:'#15803d',width:1.2,dash:'dash'}}],
+  annotations:[{xref:'paper',x:0.01,y:D.safety,text:'Safety Net - floor freezes here',
+   showarrow:false,yshift:10,font:{size:11,color:'#15803d'}}],
+  xaxis:{type:'date',gridcolor:'#eef0f3'},yaxis:{title:'$',gridcolor:'#eef0f3'},
+  legend:{orientation:'h',y:-.14},plot_bgcolor:'#fff',paper_bgcolor:'#fff'},CFG);
+Plotly.newPlot('c_starts',[
+ {x:D.starts.okx,y:D.starts.oky,type:'scatter',mode:'markers',name:'reached Safety Net',
+  marker:{size:5,color:'#59a14f',opacity:.65},
+  hovertemplate:'start %{x|%Y-%m-%d}<br>froze after %{y} days<extra></extra>'},
+ {x:D.starts.badx,y:D.starts.bady,type:'scatter',mode:'markers',name:'died first',
+  marker:{size:6,color:'#e15759',symbol:'x',opacity:.75},
+  hovertemplate:'start %{x|%Y-%m-%d}<br>never froze<extra></extra>'}],
+ {margin:{l:66,r:14,t:28,b:34},font:F,
+  title:{text:'Days from purchase to the Safety Net, by start date',x:0,font:{size:13}},
+  xaxis:{type:'date',gridcolor:'#eef0f3'},
+  yaxis:{title:'days to freeze',gridcolor:'#eef0f3',zeroline:false},
+  legend:{orientation:'h',y:-.16},plot_bgcolor:'#fff',paper_bgcolor:'#fff'},CFG);
+Plotly.newPlot('c_keep',D.keep.series.map((s,i)=>({
+ x:D.keep.labels,y:s.y,name:s.name,type:'bar',
+ marker:{color:['#4e79a7','#59a14f','#b07aa1'][i]},
+ error_y:{type:'data',symmetric:false,array:s.hi,arrayminus:s.lo,
+  color:'#6b7280',thickness:1.2,width:3},
+ hovertemplate:'%{x}<br>'+s.name+'<br>median $%{y:,.0f}<extra></extra>'})),
+ {margin:{l:70,r:14,t:28,b:52},font:F,barmode:'group',
+  title:{text:'Realized cash over a fixed window - median, with p10 to p90',
+   x:0,font:{size:13}},
+  xaxis:{title:'withdraw down to',type:'category'},
+  yaxis:{title:'cash withdrawn $',gridcolor:'#eef0f3'},
+  legend:{orientation:'h',y:-.22},plot_bgcolor:'#fff',paper_bgcolor:'#fff'},CFG);
+Plotly.newPlot('c_book',[
+ {x:D.book.x,y:D.book.live,type:'scatter',mode:'lines',name:'seats live',
+  fill:'tozeroy',line:{width:1,color:'#4e79a7',shape:'hv'},
+  fillcolor:'rgba(78,121,167,.22)'},
+ {x:D.book.x,y:D.book.cash,type:'scatter',mode:'lines',name:'cash withdrawn',
+  yaxis:'y2',line:{width:2,color:'#15803d'}}],
+ {margin:{l:60,r:66,t:28,b:34},font:F,hovermode:'x unified',
+  title:{text:'Seats live and cash taken out - '+D.book.name,x:0,font:{size:13}},
+  xaxis:{type:'date',gridcolor:'#eef0f3'},
+  yaxis:{title:'seats',gridcolor:'#eef0f3'},
+  yaxis2:{title:'cash $',overlaying:'y',side:'right',showgrid:false},
+  legend:{orientation:'h',y:-.16},plot_bgcolor:'#fff',paper_bgcolor:'#fff'},CFG);
+Plotly.newPlot('c_year',[{x:D.year.x,y:D.year.y,type:'bar',
+ marker:{color:'#4e79a7'},hovertemplate:'%{x}<br>$%{y:,.0f}<extra></extra>'}],
+ {margin:{l:70,r:14,t:28,b:34},font:F,
+  title:{text:'Cash withdrawn per year',x:0,font:{size:13}},
+  yaxis:{gridcolor:'#eef0f3'},plot_bgcolor:'#fff',paper_bgcolor:'#fff'},CFG);
+function tbl(id,rows,cols,hdr){document.getElementById(id).innerHTML=
+ '<table><thead><tr>'+hdr.map(c=>'<th>'+c+'</th>').join('')+'</tr></thead><tbody>'+
+ rows.map(r=>'<tr>'+cols.map(c=>{let v=r[c];if(v==null)v='';
+  if(typeof v==='number')v=v.toLocaleString();
+  return `<td>${v}</td>`;}).join('')+'</tr>').join('')+'</tbody></table>';}
+tbl('t_keep',D.robust,['policy','withdraw_to','ruin_rate','cash_p10','cash_median',
+ 'cash_p90','equity_median','seats_median'],
+ ['seat-buying policy','withdraw down to','ruin rate','cash p10 $','cash MEDIAN $',
+  'cash p90 $','equity left (median) $','seats bought (median)']);
+tbl('t_single',D.keeptable,['policy','withdraw_down_to','seats_bought','deaths',
+ 'live_at_end','cash','equity_in_accounts','net_wealth'],
+ ['seat-buying policy','withdraw down to','seats bought','liquidations','live at end',
+  'cash $','equity still in accounts $','net wealth $']);
+tbl('t_rec',D.rec,['metric','sim','mt5'],['metric','this simulation','your MT5 run']);
+document.getElementById('foot').textContent=
+ `run ${D.prov.run} · code ${D.prov.git} · generated ${D.gen} · `+
+ `measured on 2020-2026. RR and the window set are EA defaults, not fitted, but the `+
+ `window design still came from looking at this history. The withdrawal level is a real `+
+ `free parameter and should be walk-forward tested before it is trusted.`;
+</script></body></html>"""
+
+
+def build_html(payload):
+    try:
+        import plotly.offline as po
+    except ImportError:
+        print("(plotly missing - HTML skipped)")
+        return
+    import provenance as prov
+    payload["gen"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+    payload["prov"] = {"run": prov.RUN_ID, "git": prov.git_info().get("commit")}
+    html = (_TPL.replace("__PLOTLYJS__", po.get_plotlyjs())
+            .replace("__RRV__", f"{payload['rr']:g}")
+            .replace("__DDV__", f"{payload['dd']:,.0f}")
+            .replace("__COSTV__", f"{payload['cost']:,.0f}")
+            .replace("__NWIN__", str(payload["n_windows"]))
+            .replace("__HZV__", f"{payload['horizon']:g}")
+            .replace("__DATA__", json.dumps(payload, separators=(",", ":"),
+                                            default=str)))
+    os.makedirs("reports", exist_ok=True)
+    with open("reports/account_farming.html", "w", encoding="utf-8") as fh:
+        fh.write(html)
+    print("Saved reports/account_farming.html")
+
+
 def main():
     global TRAILING_DD, SAFETY_NET, ACCOUNT_COST
     ap = argparse.ArgumentParser(description="prop-account farming simulation")
@@ -169,6 +410,12 @@ def main():
                     help="trader's share of profit (real plans are 0.8-0.9)")
     ap.add_argument("--live", type=int, default=10,
                     help="concurrent accounts in the portfolio model")
+    ap.add_argument("--seats", type=int, default=20,
+                    help="max concurrent accounts the firm allows")
+    ap.add_argument("--seed", type=float, default=200.0,
+                    help="starting cash for the compounding book")
+    ap.add_argument("--horizon", type=float, default=2.0,
+                    help="years per book window in the robustness sweep")
     a = ap.parse_args()
     TRAILING_DD, SAFETY_NET, ACCOUNT_COST = a.dd, a.dd + 100.0, a.cost
     KEEP = SAFETY_NET                      # harvest down to the Safety Net
@@ -304,11 +551,166 @@ def main():
     print(f"\n  compare: walk-forward config (6 small accounts, tuned) ~$4,280/yr")
     print(f"           one unconstrained $5,000 account, all windows ~$4,850/yr")
 
+    # ---- withdrawals as seed capital ----------------------------------------
+    print("\n" + "=" * 88)
+    print(f"COMPOUNDING BOOK — withdrawn cash buys more seats "
+          f"(${ACCOUNT_COST:,.0f} each, max {a.seats}, start from "
+          f"${a.seed:,.0f})")
+    print("=" * 88)
+    keeps = [SAFETY_NET, 3000.0, 3500.0, 4000.0, 5000.0, 7000.0, 10000.0, 0.0]
+    books, rowsb = {}, []
+    for label, reinvest, adaptive in (("1 seat/month", False, False),
+                                      ("buy when affordable", True, False),
+                                      ("affordable + hold when full", True, True)):
+        for kp in keeps:
+            r = run_book(ex, net, mae, mfe, kp, a.seats, a.seed,
+                         1, reinvest, adaptive)
+            books[(label, kp)] = r
+            rowsb.append({"policy": label,
+                          "withdraw_down_to": "never" if kp == 0 else f"${kp:,.0f}",
+                          "seats_bought": r["bought"], "deaths": r["deaths"],
+                          "live_at_end": r["live"],
+                          "cash": round(r["cash"]),
+                          "equity_in_accounts": round(r["equity"]),
+                          "net_wealth": round(r["wealth"] * a.split)})
+    BK = pd.DataFrame(rowsb)
+    print(BK.to_string(index=False))
+    print("\n  'never' withdraw can never fund a second seat — that row is the point.")
+    print("  But these are SINGLE PATHS and the process is chaotic: bootstrapping from")
+    print(f"  ${a.seed:,.0f} has an absorbing state (no seats, no cash to buy one), so")
+    print("  adjacent parameter values can differ by orders of magnitude. Do not read")
+    print("  any single number above. The distribution below is the real answer.")
+
+    # ---- the same policies, from many start dates, over a fixed horizon ------
+    print("\n" + "=" * 88)
+    print(f"ROBUSTNESS — each policy run from {a.horizon:g}-year windows starting every "
+          "quarter")
+    print("=" * 88)
+    horizon = pd.Timedelta(days=int(365.25 * a.horizon))
+    day_arr = pd.to_datetime(ex)
+    q_starts = []
+    for d in pd.date_range(day_arr[0].normalize(), day_arr[-1], freq="QS"):
+        if d + horizon > day_arr[-1]:
+            break
+        j = int(np.searchsorted(day_arr, d))
+        k = int(np.searchsorted(day_arr, d + horizon))
+        if k - j > 200:
+            q_starts.append((d, j, k))
+    print(f"  {len(q_starts)} windows of {a.horizon:g}y, "
+          f"{q_starts[0][0].date()} .. {q_starts[-1][0].date()}\n")
+    rowsr = []
+    for label, reinvest, adaptive in (("1 seat/month", False, False),
+                                      ("buy when affordable", True, False),
+                                      ("affordable + hold when full", True, True)):
+        for kp in (SAFETY_NET, 3000.0, 4000.0, 5000.0, 7000.0, 0.0):
+            res = [run_book(ex[j:k], net[j:k], mae[j:k], mfe[j:k], kp, a.seats,
+                            a.seed, 1, reinvest, adaptive) for _, j, k in q_starts]
+            cashes = np.array([r["cash"] for r in res]) * a.split
+            rowsr.append({
+                "policy": label,
+                "withdraw_to": "never" if kp == 0 else f"${kp:,.0f}",
+                "ruin_rate": f"{np.mean([r['ruined'] for r in res]):.0%}",
+                "cash_p10": round(np.percentile(cashes, 10)),
+                "cash_median": round(np.median(cashes)),
+                "cash_p90": round(np.percentile(cashes, 90)),
+                "equity_median": round(np.median([r["equity"] for r in res]) * a.split),
+                "seats_median": int(np.median([r["bought"] for r in res])),
+            })
+    RB = pd.DataFrame(rowsr)
+    print(RB.to_string(index=False))
+    print("\n  cash_* is REALIZED, withdrawn money. equity_median is still sitting in")
+    print("  live accounts and can be lost — do not add the two and call it profit.")
+    bestr = RB.loc[RB["cash_median"].idxmax()]
+    print(f"\n  best by MEDIAN realized cash: {bestr['policy']}, withdraw to "
+          f"{bestr['withdraw_to']}  ->  ${bestr['cash_median']:,.0f} median over "
+          f"{a.horizon:g}y  (p10 ${bestr['cash_p10']:,.0f}, ruin {bestr['ruin_rate']})")
+
     os.makedirs("data/3_results", exist_ok=True)
     S.drop(columns=["yr"]).to_csv("data/3_results/farming_starts.csv", index=False)
     C.to_csv("data/3_results/farming_cadence.csv", index=False)
     yr.to_csv("data/3_results/farming_portfolio.csv")
-    print("\nSaved farming_starts.csv, farming_cadence.csv, farming_portfolio.csv")
+    BK.to_csv("data/3_results/farming_withdrawal_policies.csv", index=False)
+    print("\nSaved farming_starts.csv, farming_cadence.csv, farming_portfolio.csv, "
+          "farming_withdrawal_policies.csv")
+
+    # ---- HTML ---------------------------------------------------------------
+    med = FULL[FULL["frozen"]]["days_to_freeze"].median()
+    rep = FULL[FULL["frozen"]].iloc[
+        (FULL[FULL["frozen"]]["days_to_freeze"] - med).abs().argsort().iloc[0]]
+    path = trace_account(ex, net, mae, mfe, int(rep["start_i"]), KEEP)
+    stp = max(1, len(path) // 1500)
+    path = path[::stp]
+    bestrow = BK.loc[BK["net_wealth"].idxmax()]
+    bk = books[(bestr["policy"],
+                0.0 if bestr["withdraw_to"] == "never"
+                else float(bestr["withdraw_to"].replace("$", "").replace(",", "")))]
+    bs = bk["series"].groupby(bk["series"]["day"].dt.date).last().reset_index(drop=True)
+    # yearly cash of the SAME book shown above, so the two charts agree
+    bkyr = (bk["series"].assign(y=bk["series"]["day"].dt.year)
+            .groupby("y")["withdrawn"].last().diff()
+            .fillna(bk["series"].assign(y=bk["series"]["day"].dt.year)
+                    .groupby("y")["withdrawn"].last().iloc[0]) * a.split).round()
+    okS = S[S["frozen"]]
+    badS = S[~S["frozen"]]
+    build_html({
+        "rr": a.rr, "dd": TRAILING_DD, "cost": ACCOUNT_COST, "seed": int(a.seed),
+        "safety": SAFETY_NET, "horizon": a.horizon, "n_windows": len(q_starts),
+        "cards": [
+            ["reaches Safety Net", f"{FULL['frozen'].mean():.0%}", "ok",
+             "of seats with a full year of runway"],
+            ["median days to get there", f"{med:.0f}", "",
+             f"p25 {okS['days_to_freeze'].quantile(.25):.0f} / "
+             f"p75 {okS['days_to_freeze'].quantile(.75):.0f}"],
+            ["per seat-year", "$3,849", "ok",
+             "vs $778 for the tuned 6-account config"],
+            ["best withdrawal policy", bestr["withdraw_to"], "",
+             bestr["policy"]],
+            [f"median cash per {a.horizon:g}y", f"${bestr['cash_median']:,.0f}", "ok",
+             f"p10 ${bestr['cash_p10']:,.0f} · p90 ${bestr['cash_p90']:,.0f}"],
+            ["ruin rate", bestr["ruin_rate"],
+             "bad" if bestr["ruin_rate"] != "0%" else "ok",
+             "book wiped out, no cash to restart"],
+        ],
+        "life": {"x": [str(p[0]) for p in path],
+                 "tot": [round(p[1], 1) for p in path],
+                 "eq": [round(p[2], 1) for p in path],
+                 "fl": [round(p[3], 1) for p in path]},
+        "starts": {"okx": [str(d) for d in okS["start"]],
+                   "oky": [int(v) for v in okS["days_to_freeze"]],
+                   "badx": [str(d) for d in badS["start"]],
+                   "bady": [-40] * len(badS)},
+        "keep": {
+            "labels": list(RB[RB["policy"] == RB["policy"].iloc[0]]["withdraw_to"]),
+            "series": [{"name": p,
+                        "y": [int(v) for v in RB[RB["policy"] == p]["cash_median"]],
+                        "hi": [int(h - m) for h, m in
+                               zip(RB[RB["policy"] == p]["cash_p90"],
+                                   RB[RB["policy"] == p]["cash_median"])],
+                        "lo": [int(m - l) for m, l in
+                               zip(RB[RB["policy"] == p]["cash_median"],
+                                   RB[RB["policy"] == p]["cash_p10"])]}
+                       for p in RB["policy"].unique()]},
+        "robust": RB.to_dict("records"),
+        "book": {"x": [str(d) for d in bs["day"]],
+                 "live": [int(v) for v in bs["live"]],
+                 "cash": [round(float(v)) for v in bs["withdrawn"]],
+                 "name": f"{bestr['policy']}, withdraw to {bestr['withdraw_to']}"
+                         " (one illustrative path)"},
+        "year": {"x": [str(i) for i in bkyr.index],
+                 "y": [float(v) for v in bkyr]},
+        "keeptable": BK.to_dict("records"),
+        "rec": [
+            {"metric": "trades", "sim": f"{len(net):,}",
+             "mt5": f"{MT5_REF['trades']:,}"},
+            {"metric": "gross profit", "sim": f"${gross:,.0f}",
+             "mt5": f"${MT5_REF['gross']:,.0f}"},
+            {"metric": "equity drawdown",
+             "sim": f"${wf.dd_equity(net, mae, mfe):,.0f}",
+             "mt5": f"${MT5_REF['eq_dd']:,.0f}"},
+            {"metric": "windows merged", "sim": f"{len(keys)} of 23",
+             "mt5": "23 (one export is tester-blown, dropped here)"},
+        ],
+    })
     print("\nNOTE: every account trades the SAME signals and differs only by start")
     print("date. One drawdown deep enough to kill one can kill the whole book.")
 
