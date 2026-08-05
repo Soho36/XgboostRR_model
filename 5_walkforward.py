@@ -130,79 +130,94 @@ def read_pass(path):
     return d.sort_values("exit_time")
 
 
-print("Loading verified sweeps (once; folds are in-memory slices) ...")
-t0 = time.time()
 DB = {}   # (strat, window, rr) -> dict of numpy arrays sorted by exit_time
 MANIFESTS = {}
-rr_grid, cutoffs, starts = None, set(), set()
+rr_grid = None
 legacy_manifest_count = 0
-sweep_dirs = sorted(glob.glob(os.path.join(SWEEPS_DIR, "*", "*")))
-for wdir in sweep_dirs:
-    if not os.path.isdir(wdir):
-        continue
-    strat = os.path.basename(os.path.dirname(wdir))
-    if strat.endswith("_stats"):
-        continue
-    window = os.path.basename(wdir)
-    mf = os.path.join(wdir, "_manifest.json")
-    if not os.path.isfile(mf):
-        fail_input(f"missing manifest for {strat} {window}")
-    manifest = read_manifest(mf)
-    if manifest.get("complete") is False:
-        fail_input(f"incomplete manifest for {strat} {window}")
-    if manifest.get("complete") is None:
-        legacy_manifest_count += 1
-    if not manifest.get("from") or not manifest.get("to"):
-        fail_input(f"manifest for {strat} {window} has no data range")
-    starts.add(str(manifest["from"]))
-    cutoffs.add(str(manifest["to"]))
+DATA_START = DATA_END_EXCLUSIVE = None
+WINDOWS = []
 
-    found = []
-    for path in sorted(glob.glob(os.path.join(wdir, "*.csv"))):
-        m = re.match(rf"^{re.escape(window)}_([0-9.]+)\.csv$", os.path.basename(path))
-        if not m:
-            fail_input(f"unexpected CSV name in {strat} {window}: {os.path.basename(path)}")
-        rr = round(float(m.group(1)), 2)
-        key = (strat, window, rr)
-        if key in DB:
-            fail_input(f"duplicate RR {rr:g} in {strat} {window}")
-        d = read_pass(path)
-        DB[key] = {
-            "en": d["entry_time"].values.astype("datetime64[s]"),
-            "ex": d["exit_time"].values.astype("datetime64[s]"),
-            "net": (d["profit"].values - COMMISSION).astype(np.float64),
-            "mae": d["mae"].values.astype(np.float64),
-            "mfe": d["mfe"].values.astype(np.float64),
-        }
-        found.append(rr)
-    found = tuple(sorted(found))
-    declared = manifest.get("expected", manifest.get("files_expected",
-                                                      manifest.get("files_collected")))
-    if declared is not None and int(declared) != len(found):
-        fail_input(f"{strat} {window} has {len(found)} passes, manifest says {declared}")
-    if rr_grid is None:
-        rr_grid = found
-    elif found != rr_grid:
-        fail_input(f"RR grid differs in {strat} {window}")
-    MANIFESTS[(strat, window)] = manifest
 
-if not DB:
-    fail_input(f"no sweep passes under {SWEEPS_DIR}")
-if len(starts) != 1 or len(cutoffs) != 1:
-    fail_input(f"mixed source ranges: from={sorted(starts)}, to={sorted(cutoffs)}")
-try:
-    DATA_START = pd.to_datetime(next(iter(starts)), format="%Y.%m.%d")
-    DATA_END_EXCLUSIVE = (pd.to_datetime(next(iter(cutoffs)), format="%Y.%m.%d")
-                          + pd.Timedelta(days=1))
-except (TypeError, ValueError) as e:
-    fail_input(f"invalid manifest date: {e}")
-WINDOWS = sorted({(s, w) for (s, w, _r) in DB},
-                 key=lambda k: (k[0], int(k[1].split("-")[0])))
-print(f"  {len(DB)} passes, {len(WINDOWS)} windows, {len(rr_grid)} RRs | "
-      f"{DATA_START.date()} -> {(DATA_END_EXCLUSIVE - pd.Timedelta(days=1)).date()} "
-      f"in {time.time()-t0:,.0f}s"
-      + (f"  ({legacy_manifest_count} legacy manifests verified by file grid)"
-         if legacy_manifest_count else ""))
+def load_db():
+    """Read and gate every sweep pass into memory. Idempotent; call once.
+
+    Kept as a function (rather than import-time work) so a driver script can
+    reuse this exact loader and the exact selection/allocation code below
+    instead of reimplementing it and drifting.
+    """
+    global rr_grid, legacy_manifest_count, DATA_START, DATA_END_EXCLUSIVE, WINDOWS
+    if DB:
+        return
+    print("Loading verified sweeps (once; folds are in-memory slices) ...")
+    t0 = time.time()
+    cutoffs, starts = set(), set()
+    sweep_dirs = sorted(glob.glob(os.path.join(SWEEPS_DIR, "*", "*")))
+    for wdir in sweep_dirs:
+        if not os.path.isdir(wdir):
+            continue
+        strat = os.path.basename(os.path.dirname(wdir))
+        if strat.endswith("_stats"):
+            continue
+        window = os.path.basename(wdir)
+        mf = os.path.join(wdir, "_manifest.json")
+        if not os.path.isfile(mf):
+            fail_input(f"missing manifest for {strat} {window}")
+        manifest = read_manifest(mf)
+        if manifest.get("complete") is False:
+            fail_input(f"incomplete manifest for {strat} {window}")
+        if manifest.get("complete") is None:
+            legacy_manifest_count += 1
+        if not manifest.get("from") or not manifest.get("to"):
+            fail_input(f"manifest for {strat} {window} has no data range")
+        starts.add(str(manifest["from"]))
+        cutoffs.add(str(manifest["to"]))
+
+        found = []
+        for path in sorted(glob.glob(os.path.join(wdir, "*.csv"))):
+            m = re.match(rf"^{re.escape(window)}_([0-9.]+)\.csv$", os.path.basename(path))
+            if not m:
+                fail_input(f"unexpected CSV name in {strat} {window}: {os.path.basename(path)}")
+            rr = round(float(m.group(1)), 2)
+            key = (strat, window, rr)
+            if key in DB:
+                fail_input(f"duplicate RR {rr:g} in {strat} {window}")
+            d = read_pass(path)
+            DB[key] = {
+                "en": d["entry_time"].values.astype("datetime64[s]"),
+                "ex": d["exit_time"].values.astype("datetime64[s]"),
+                "net": (d["profit"].values - COMMISSION).astype(np.float64),
+                "mae": d["mae"].values.astype(np.float64),
+                "mfe": d["mfe"].values.astype(np.float64),
+            }
+            found.append(rr)
+        found = tuple(sorted(found))
+        declared = manifest.get("expected", manifest.get("files_expected",
+                                                          manifest.get("files_collected")))
+        if declared is not None and int(declared) != len(found):
+            fail_input(f"{strat} {window} has {len(found)} passes, manifest says {declared}")
+        if rr_grid is None:
+            rr_grid = found
+        elif found != rr_grid:
+            fail_input(f"RR grid differs in {strat} {window}")
+        MANIFESTS[(strat, window)] = manifest
+
+    if not DB:
+        fail_input(f"no sweep passes under {SWEEPS_DIR}")
+    if len(starts) != 1 or len(cutoffs) != 1:
+        fail_input(f"mixed source ranges: from={sorted(starts)}, to={sorted(cutoffs)}")
+    try:
+        DATA_START = pd.to_datetime(next(iter(starts)), format="%Y.%m.%d")
+        DATA_END_EXCLUSIVE = (pd.to_datetime(next(iter(cutoffs)), format="%Y.%m.%d")
+                              + pd.Timedelta(days=1))
+    except (TypeError, ValueError) as e:
+        fail_input(f"invalid manifest date: {e}")
+    WINDOWS = sorted({(s, w) for (s, w, _r) in DB},
+                     key=lambda k: (k[0], int(k[1].split("-")[0])))
+    print(f"  {len(DB)} passes, {len(WINDOWS)} windows, {len(rr_grid)} RRs | "
+          f"{DATA_START.date()} -> {(DATA_END_EXCLUSIVE - pd.Timedelta(days=1)).date()} "
+          f"in {time.time()-t0:,.0f}s"
+          + (f"  ({legacy_manifest_count} legacy manifests verified by file grid)"
+             if legacy_manifest_count else ""))
 
 
 def sl(key, a, b):
@@ -286,9 +301,10 @@ def has_adjacent_hours(combo):
     return any(b - a == 1 for a, b in zip(hours, hours[1:]))
 
 
-def allocate(picks, fit_a, fit_b):
-    """Exact ILP on the fit slice: strategy-pure groups of 1-2, each account at
-    most one group, each window once, group DD <= CAP_FRACTION * account."""
+def build_groups(picks, fit_a, fit_b):
+    """Candidate account groups (strategy-pure, 1..MAX_PER_ACCOUNT windows) with
+    their fit-period profit and drawdowns. Independent of the account cap, so a
+    cap sweep can reuse one build."""
     keys = [(s, w, picks[(s, w)]) for (s, w) in picks]
     by_s = {}
     for k in keys:
@@ -303,15 +319,22 @@ def allocate(picks, fit_a, fit_b):
                 p, d_raw, d_upper, _ = group_eval(combo, fit_a, fit_b)
                 groups.append({"keys": combo, "profit": p, "dd_raw": d_raw,
                                "dd": d_upper})
+    return keys, groups
+
+
+def solve_groups(keys, groups, cap_fraction, require_full=True):
+    """Exact ILP: each account at most one group (exactly one when require_full),
+    each window at most once, group DD <= cap_fraction * account limit."""
     names = list(ACCOUNTS)
     var = [(gi, ai) for gi, g in enumerate(groups) for ai, n in enumerate(names)
-           if g["dd"] <= CAP_FRACTION * ACCOUNTS[n]]
+           if g["dd"] <= cap_fraction * ACCOUNTS[n]]
     if not var:
         return []
     c = np.array([-groups[gi]["profit"] for gi, _ in var])
     rows, lb, ub = [], [], []
     for ai in range(len(names)):                     # same as step 3: exactly one group
-        rows.append([1.0 if a == ai else 0.0 for _, a in var]); lb.append(1); ub.append(1)
+        rows.append([1.0 if a == ai else 0.0 for _, a in var])
+        lb.append(1 if require_full else 0); ub.append(1)
     for k in keys:                                   # each window <= once
         rows.append([1.0 if k in groups[gi]["keys"] else 0.0 for gi, _ in var])
         lb.append(0); ub.append(1)
@@ -320,6 +343,13 @@ def allocate(picks, fit_a, fit_b):
     if not res.success:
         return []
     return [(groups[gi], names[ai]) for (gi, ai), x in zip(var, res.x) if x > 0.5]
+
+
+def allocate(picks, fit_a, fit_b):
+    """Exact ILP on the fit slice: strategy-pure groups of 1-2, each account at
+    most one group, each window once, group DD <= CAP_FRACTION * account."""
+    keys, groups = build_groups(picks, fit_a, fit_b)
+    return solve_groups(keys, groups, CAP_FRACTION)
 
 
 def score_allocation(alloc, a, b):
@@ -351,31 +381,45 @@ def fixed_rr_picks():
     return picks
 
 
+_BLOWN = {}
+
+
+def pass_is_blown(strat, window, rr):
+    """True if MT5 liquidated this pass, so its per-trade export is truncated.
+
+    The full-period stats are intentionally *not* used to calibrate a fold or
+    alter its choice. They are used only to detect a pass whose tester
+    liquidation omitted its fatal trade from the per-trade export; scoring such
+    a pass would otherwise manufacture a false result. Cached per pass.
+    """
+    key = (strat, window, rr)
+    if key in _BLOWN:
+        return _BLOWN[key]
+    path = os.path.join(SWEEPS_DIR, f"{strat}_stats", window,
+                        f"{window}_{rr:.2f}_stats.csv")
+    if not os.path.isfile(path):
+        fail_input(f"missing MT5 stats for selected pass {strat} {window}@{rr:g}")
+    try:
+        try:                                       # MT5 writes UTF-16; tolerate UTF-8 too
+            stats = pd.read_csv(path, sep="\t", encoding="utf-16")
+        except UnicodeError:
+            stats = pd.read_csv(path, sep="\t", encoding="utf-8")
+        row = stats.iloc[0]
+        blown = (float(row["equity_dd"]) >= DEPOSIT * 0.95 or
+                 float(row["net_profit"]) <= -DEPOSIT * 0.95)
+    except (OSError, ValueError, KeyError, IndexError) as e:
+        fail_input(f"unreadable MT5 stats for selected pass {strat} {window}@{rr:g}: {e}")
+    _BLOWN[key] = blown
+    return blown
+
+
 def reject_known_blown_picks(picks):
     """Fail closed if a selected export is known to be tester-truncated.
 
-    The full-period stats are intentionally *not* used to calibrate a fold or
-    alter its choice. They are used only to reject a selected pass whose tester
-    liquidation omitted its fatal trade from the per-trade export; scoring such
-    a pass would otherwise manufacture a false OOS result. Time-bounded MT5
-    stats are required if this gate fires.
+    Time-bounded MT5 stats are required if this gate fires.
     """
     for (strat, window), rr in picks.items():
-        path = os.path.join(SWEEPS_DIR, f"{strat}_stats", window,
-                            f"{window}_{rr:.2f}_stats.csv")
-        if not os.path.isfile(path):
-            fail_input(f"missing MT5 stats for selected pass {strat} {window}@{rr:g}")
-        try:
-            try:                                   # MT5 writes UTF-16; tolerate UTF-8 too
-                stats = pd.read_csv(path, sep="\t", encoding="utf-16")
-            except UnicodeError:
-                stats = pd.read_csv(path, sep="\t", encoding="utf-8")
-            row = stats.iloc[0]
-            blown = (float(row["equity_dd"]) >= DEPOSIT * 0.95 or
-                     float(row["net_profit"]) <= -DEPOSIT * 0.95)
-        except (OSError, ValueError, KeyError, IndexError) as e:
-            fail_input(f"unreadable MT5 stats for selected pass {strat} {window}@{rr:g}: {e}")
-        if blown:
+        if pass_is_blown(strat, window, rr):
             raise SystemExit(
                 "Walk-forward cannot score a selected tester-blown pass from a "
                 f"truncated export: {strat} {window}@{rr:g}. Generate "
@@ -479,170 +523,184 @@ document.getElementById('foot').textContent=
 </script></body></html>"""
 
 # ---- WALK THE FOLDS ---------------------------------------------------------
-years = lambda a, b: max((b - a).days / 365.25, 1e-9)
-fold_rows, oos_trades, acct_rows = [], [], []
-for fn, (fit_end, planned_test_end) in enumerate(FOLDS, 1):
-    test_end = min(planned_test_end, DATA_END_EXCLUSIVE)
-    if test_end <= fit_end:
-        raise SystemExit(f"Fold {fn} has no test data after the source cutoff.")
-    t0 = time.time()
-    picks = select(FIT_START, fit_end)
-    reject_known_blown_picks(picks)
-    alloc = allocate(picks, FIT_START, fit_end)
-    if len(alloc) != len(ACCOUNTS):
-        raise SystemExit(f"Fold {fn}: no production-equivalent allocation at "
-                         f"{CAP_FRACTION:.0%} cap ({len(alloc)}/{len(ACCOUNTS)} accounts).")
-    is_p = sum(g["profit"] for g, _ in alloc)
-    oos_p, worst, accepted = score_allocation(alloc, fit_end, test_end)
-    oos_trades.extend(accepted)
-    acct_rows.extend((fn, acct, ex, net, mae, mfe)
-                     for ex, net, mae, mfe, acct in accepted)
+def years(a, b):
+    return max((b - a).days / 365.25, 1e-9)
 
-    # The control uses exactly the same fit-period allocator, DD cap and replay
-    # constraint. Only its RR rule is simpler: one pre-declared fixed RR.
-    base_alloc = allocate(fixed_rr_picks(), FIT_START, fit_end)
-    if len(base_alloc) != len(ACCOUNTS):
-        raise SystemExit(f"Fold {fn}: fixed-RR control has no risk-matched allocation at "
-                         f"{CAP_FRACTION:.0%} cap ({len(base_alloc)}/{len(ACCOUNTS)} accounts).")
-    base, base_worst, _ = score_allocation(base_alloc, fit_end, test_end)
-    is_y, oos_y = years(FIT_START, fit_end), years(fit_end, test_end)
-    fold_rows.append({
-        "fold": fn, "fit_end_exclusive": fit_end.date(),
-        "test_start": fit_end.date(),
-        "test_end_inclusive": (test_end - pd.Timedelta(days=1)).date(),
-        "windows_picked": len(picks), "accounts_used": len(alloc),
-        "IS_net": round(is_p), "IS_net_per_yr": round(is_p / is_y),
-        "OOS_net": round(oos_p), "OOS_net_per_yr": round(oos_p / oos_y),
-        "OOS_worst_acct": worst[0], "OOS_worst_dd_raw": round(worst[2]),
-        "OOS_worst_dd_upper": round(worst[3]),
-        "OOS_worst_pct_of_limit": round(worst[1] * 100, 1),
-        "fixed_RR_accounts_used": len(base_alloc),
-        "fixed_RR_OOS_net": round(base),
-        "fixed_RR_worst_acct": base_worst[0],
-        "fixed_RR_worst_pct_of_limit": round(base_worst[1] * 100, 1),
-        "picks": "; ".join(f"{s} {w}@{picks[(s,w)]:g}" for (s, w) in sorted(picks)),
-    })
-    r = fold_rows[-1]
-    print(f"\nFold {fn}  fit->{fit_end.date()}  test->{(test_end - pd.Timedelta(days=1)).date()}  "
-          f"({time.time()-t0:,.0f}s)\n"
-          f"  picked {r['windows_picked']} windows on {r['accounts_used']} accounts | "
-          f"IS ${r['IS_net']:,}/{is_y:.1f}y  OOS ${r['OOS_net']:,}/{oos_y:.1f}y | "
-          f"worst acct {r['OOS_worst_acct']} {r['OOS_worst_pct_of_limit']}% | "
-          f"fixed-RR control ${r['fixed_RR_OOS_net']:,}")
-
-F = pd.DataFrame(fold_rows)
-oos_trades.sort(key=lambda x: x[0])
-eq = np.cumsum([n for _, n, *_ in oos_trades])
-peak = np.maximum.accumulate(np.concatenate(([0.0], eq)))[1:]
-stitched_closed_dd = float((peak - eq).max()) if len(eq) else 0.0
-
-wfe = F["OOS_net_per_yr"].sum() / max(F["IS_net_per_yr"].sum(), 1e-9)
-summary = {
-    "folds": len(F),
-    "folds_OOS_positive": int((F["OOS_net"] > 0).sum()),
-    "WFE": round(wfe, 3),
-    "OOS_total_net": int(F["OOS_net"].sum()),
-    "fixed_RR_total_net": int(F["fixed_RR_OOS_net"].sum()),
-    "beats_fixed_RR_risk_matched": bool(F["OOS_net"].sum() > F["fixed_RR_OOS_net"].sum()),
-    "stitched_OOS_closedDD": round(stitched_closed_dd),
-    "any_acct_over_limit": bool((F["OOS_worst_pct_of_limit"] > 100).any()),
-}
-print("\n" + "=" * 78)
-print("WALK-FORWARD SUMMARY   (pass bar: WFE>=0.5, >=3/4 folds +, no acct >100%, "
-      "beats risk-matched fixed-RR control)")
-print("=" * 78)
-for k, v in summary.items():
-    print(f"  {k:<24} {v}")
-
-os.makedirs("data/3_results", exist_ok=True)
-F.to_csv("data/3_results/walkforward_folds.csv", index=False)
-pd.DataFrame([summary]).to_csv("data/3_results/walkforward_summary.csv", index=False)
-prov.write("data/3_results/_provenance_step5.json", prov.base(
-    "5_walkforward",
-    folds=[str(f[0].date()) for f in FOLDS],
-    source_data={
-        "from": str(DATA_START.date()),
-        "to_inclusive": str((DATA_END_EXCLUSIVE - pd.Timedelta(days=1)).date()),
-        "manifests": len(MANIFESTS),
-        "windows": len(WINDOWS),
-        "rr_count": len(rr_grid),
-        "legacy_manifests_verified_by_file_grid": legacy_manifest_count,
-    },
-    summary=summary,
-    settings={"CAP_FRACTION": CAP_FRACTION, "BASELINE_RR": BASELINE_RR,
-              "accounts": ACCOUNTS, "MAX_PER_ACCOUNT": MAX_PER_ACCOUNT,
-              "ALLOW_MIXED_STRATEGIES": ALLOW_MIXED_STRATEGIES,
-              "FORBID_ADJACENT_WINDOWS": FORBID_ADJACENT_WINDOWS,
-              "DD_FOR_CAP_AND_OOS": "MFE-first upper bound"},
-    limitations=["no exact per-fold MT5 calibration; conservative MFE-first DD bound used",
-                 "selected globally blown passes fail closed; time-bounded stats required",
-                 "thresholds chosen with full-history knowledge",
-                 "meta-parameters/window design remain historically fitted"]))
-print("\nSaved data/3_results/walkforward_folds.csv, walkforward_summary.csv")
 
 # ---- PROP-REALITY BREACH ANALYSIS -------------------------------------------
-# The scorer above never terminates a breached account: it keeps counting that
+# The scorer never terminates a breached account: it keeps counting that
 # account's trades for the whole test period. A real prop account STOPS at its
-# limit. This block finds, per fold x account, the first trade where the running
+# limit. This finds, per fold x account, the first trade where the running
 # (upper-bound) equity DD exceeds the limit, and splits the account's OOS net
 # into "up to breach" vs "after breach" — the latter is profit a real account
 # would never have realised. termination_adjusted_OOS is the honest prop number
 # (before eval/reset fees for replacing the blown account).
-breach_rows = []
-for (fn, acct), grp in pd.DataFrame(
-        acct_rows, columns=["fold", "acct", "ex", "net", "mae", "mfe"]
-        ).groupby(["fold", "acct"]):
-    grp = grp.sort_values("ex")
-    limit = ACCOUNTS[acct]
-    eq = peak = mdd = 0.0
-    b_i, b_eq = None, None
-    for i, (n, a_, f_) in enumerate(zip(grp["net"], grp["mae"], grp["mfe"])):
-        peak = max(peak, eq + max(f_, 0.0))
-        mdd = max(mdd, peak - (eq + min(a_, 0.0)))
-        eq += n
-        peak = max(peak, eq)
-        mdd = max(mdd, peak - eq)
-        if b_i is None and mdd > limit:
-            b_i, b_eq = i, eq                       # breach happens ON this trade
-    total = float(grp["net"].sum())
-    breach_rows.append({
-        "fold": fn, "acct": acct, "limit": limit, "OOS_net_full": round(total),
-        "breached": b_i is not None,
-        "breach_date": str(grp["ex"].iloc[b_i])[:10] if b_i is not None else "",
-        "net_at_breach": round(b_eq) if b_i is not None else None,
-        "post_breach_net": round(total - b_eq) if b_i is not None else 0,
-    })
-B = pd.DataFrame(breach_rows)
-post = int(B["post_breach_net"].sum())
-n_breach = int(B["breached"].sum())
-adj = int(F["OOS_net"].sum()) - post
-print("\nPROP-REALITY: account termination at limit")
-print(f"  breached account-folds        {n_breach} of {len(B)}")
-print(f"  post-breach net (uncounted by a real account) ${post:,}")
-print(f"  OOS as scored (no termination) ${int(F['OOS_net'].sum()):,}")
-print(f"  OOS termination-adjusted       ${adj:,}  (+ eval/reset fees x {n_breach})")
-B.to_csv("data/3_results/walkforward_breaches.csv", index=False)
+def breach_table(acct_rows):
+    """acct_rows: (fold, acct, exit_time, net, mae, mfe) of scored OOS trades."""
+    breach_rows = []
+    for (fn, acct), grp in pd.DataFrame(
+            acct_rows, columns=["fold", "acct", "ex", "net", "mae", "mfe"]
+            ).groupby(["fold", "acct"]):
+        grp = grp.sort_values("ex")
+        limit = ACCOUNTS[acct]
+        eq = peak = mdd = 0.0
+        b_i, b_eq = None, None
+        for i, (n, a_, f_) in enumerate(zip(grp["net"], grp["mae"], grp["mfe"])):
+            peak = max(peak, eq + max(f_, 0.0))
+            mdd = max(mdd, peak - (eq + min(a_, 0.0)))
+            eq += n
+            peak = max(peak, eq)
+            mdd = max(mdd, peak - eq)
+            if b_i is None and mdd > limit:
+                b_i, b_eq = i, eq                   # breach happens ON this trade
+        total = float(grp["net"].sum())
+        breach_rows.append({
+            "fold": fn, "acct": acct, "limit": limit, "OOS_net_full": round(total),
+            "breached": b_i is not None,
+            "breach_date": str(grp["ex"].iloc[b_i])[:10] if b_i is not None else "",
+            "net_at_breach": round(b_eq) if b_i is not None else None,
+            "post_breach_net": round(total - b_eq) if b_i is not None else 0,
+        })
+    return pd.DataFrame(breach_rows)
 
-# ---- HTML REPORT ------------------------------------------------------------
-try:
-    import plotly.offline as po
-    ms = [pd.Timestamp(t[0]).value // 10**6 for t in oos_trades]
-    eqs = np.round(eq_ := np.cumsum([t[1] for t in oos_trades]), 1).tolist()
-    dds = np.round(eq_ - np.maximum.accumulate(
-        np.concatenate(([0.0], eq_)))[1:], 1).tolist()
-    payload = {
-        "sum": summary, "folds": F.to_dict("records"),
-        "breach": B.to_dict("records"),
-        "eq": {"x": ms, "y": eqs, "dd": dds},
-        "bounds": [str(f[0].date()) for f in FOLDS],
-        "adj": {"post": post, "n": n_breach, "adjusted": adj},
-        "gen": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
-        "prov": {"run": prov.RUN_ID, "git": prov.git_info().get("commit")},
+
+def main():
+    load_db()
+    fold_rows, oos_trades, acct_rows = [], [], []
+    for fn, (fit_end, planned_test_end) in enumerate(FOLDS, 1):
+        test_end = min(planned_test_end, DATA_END_EXCLUSIVE)
+        if test_end <= fit_end:
+            raise SystemExit(f"Fold {fn} has no test data after the source cutoff.")
+        t0 = time.time()
+        picks = select(FIT_START, fit_end)
+        reject_known_blown_picks(picks)
+        alloc = allocate(picks, FIT_START, fit_end)
+        if len(alloc) != len(ACCOUNTS):
+            raise SystemExit(f"Fold {fn}: no production-equivalent allocation at "
+                             f"{CAP_FRACTION:.0%} cap ({len(alloc)}/{len(ACCOUNTS)} accounts).")
+        is_p = sum(g["profit"] for g, _ in alloc)
+        oos_p, worst, accepted = score_allocation(alloc, fit_end, test_end)
+        oos_trades.extend(accepted)
+        acct_rows.extend((fn, acct, ex, net, mae, mfe)
+                         for ex, net, mae, mfe, acct in accepted)
+
+        # The control uses exactly the same fit-period allocator, DD cap and
+        # replay constraint. Only its RR rule is simpler: one fixed RR.
+        base_alloc = allocate(fixed_rr_picks(), FIT_START, fit_end)
+        if len(base_alloc) != len(ACCOUNTS):
+            raise SystemExit(f"Fold {fn}: fixed-RR control has no risk-matched allocation at "
+                             f"{CAP_FRACTION:.0%} cap ({len(base_alloc)}/{len(ACCOUNTS)} accounts).")
+        base, base_worst, _ = score_allocation(base_alloc, fit_end, test_end)
+        is_y, oos_y = years(FIT_START, fit_end), years(fit_end, test_end)
+        fold_rows.append({
+            "fold": fn, "fit_end_exclusive": fit_end.date(),
+            "test_start": fit_end.date(),
+            "test_end_inclusive": (test_end - pd.Timedelta(days=1)).date(),
+            "windows_picked": len(picks), "accounts_used": len(alloc),
+            "IS_net": round(is_p), "IS_net_per_yr": round(is_p / is_y),
+            "OOS_net": round(oos_p), "OOS_net_per_yr": round(oos_p / oos_y),
+            "OOS_worst_acct": worst[0], "OOS_worst_dd_raw": round(worst[2]),
+            "OOS_worst_dd_upper": round(worst[3]),
+            "OOS_worst_pct_of_limit": round(worst[1] * 100, 1),
+            "fixed_RR_accounts_used": len(base_alloc),
+            "fixed_RR_OOS_net": round(base),
+            "fixed_RR_worst_acct": base_worst[0],
+            "fixed_RR_worst_pct_of_limit": round(base_worst[1] * 100, 1),
+            "picks": "; ".join(f"{s} {w}@{picks[(s,w)]:g}" for (s, w) in sorted(picks)),
+        })
+        r = fold_rows[-1]
+        print(f"\nFold {fn}  fit->{fit_end.date()}  "
+              f"test->{(test_end - pd.Timedelta(days=1)).date()}  ({time.time()-t0:,.0f}s)\n"
+              f"  picked {r['windows_picked']} windows on {r['accounts_used']} accounts | "
+              f"IS ${r['IS_net']:,}/{is_y:.1f}y  OOS ${r['OOS_net']:,}/{oos_y:.1f}y | "
+              f"worst acct {r['OOS_worst_acct']} {r['OOS_worst_pct_of_limit']}% | "
+              f"fixed-RR control ${r['fixed_RR_OOS_net']:,}")
+
+    F = pd.DataFrame(fold_rows)
+    oos_trades.sort(key=lambda x: x[0])
+    eq = np.cumsum([n for _, n, *_ in oos_trades])
+    peak = np.maximum.accumulate(np.concatenate(([0.0], eq)))[1:]
+    stitched_closed_dd = float((peak - eq).max()) if len(eq) else 0.0
+
+    wfe = F["OOS_net_per_yr"].sum() / max(F["IS_net_per_yr"].sum(), 1e-9)
+    summary = {
+        "folds": len(F),
+        "folds_OOS_positive": int((F["OOS_net"] > 0).sum()),
+        "WFE": round(wfe, 3),
+        "OOS_total_net": int(F["OOS_net"].sum()),
+        "fixed_RR_total_net": int(F["fixed_RR_OOS_net"].sum()),
+        "beats_fixed_RR_risk_matched": bool(F["OOS_net"].sum() > F["fixed_RR_OOS_net"].sum()),
+        "stitched_OOS_closedDD": round(stitched_closed_dd),
+        "any_acct_over_limit": bool((F["OOS_worst_pct_of_limit"] > 100).any()),
     }
-    html = (_WF_TPL.replace("__PLOTLYJS__", po.get_plotlyjs())
-            .replace("__DATA__", json.dumps(payload, separators=(",", ":"), default=str)))
-    with open("reports/walkforward.html", "w", encoding="utf-8") as fh:
-        fh.write(html)
-    print("Saved reports/walkforward.html")
-except ImportError:
-    print("(plotly missing - HTML skipped)")
+    print("\n" + "=" * 78)
+    print("WALK-FORWARD SUMMARY   (pass bar: WFE>=0.5, >=3/4 folds +, no acct >100%, "
+          "beats risk-matched fixed-RR control)")
+    print("=" * 78)
+    for k, v in summary.items():
+        print(f"  {k:<24} {v}")
+
+    os.makedirs("data/3_results", exist_ok=True)
+    F.to_csv("data/3_results/walkforward_folds.csv", index=False)
+    pd.DataFrame([summary]).to_csv("data/3_results/walkforward_summary.csv", index=False)
+    prov.write("data/3_results/_provenance_step5.json", prov.base(
+        "5_walkforward",
+        folds=[str(f[0].date()) for f in FOLDS],
+        source_data={
+            "from": str(DATA_START.date()),
+            "to_inclusive": str((DATA_END_EXCLUSIVE - pd.Timedelta(days=1)).date()),
+            "manifests": len(MANIFESTS),
+            "windows": len(WINDOWS),
+            "rr_count": len(rr_grid),
+            "legacy_manifests_verified_by_file_grid": legacy_manifest_count,
+        },
+        summary=summary,
+        settings={"CAP_FRACTION": CAP_FRACTION, "BASELINE_RR": BASELINE_RR,
+                  "accounts": ACCOUNTS, "MAX_PER_ACCOUNT": MAX_PER_ACCOUNT,
+                  "ALLOW_MIXED_STRATEGIES": ALLOW_MIXED_STRATEGIES,
+                  "FORBID_ADJACENT_WINDOWS": FORBID_ADJACENT_WINDOWS,
+                  "DD_FOR_CAP_AND_OOS": "MFE-first upper bound"},
+        limitations=["no exact per-fold MT5 calibration; conservative MFE-first DD bound used",
+                     "selected globally blown passes fail closed; time-bounded stats required",
+                     "thresholds chosen with full-history knowledge",
+                     "meta-parameters/window design remain historically fitted"]))
+    print("\nSaved data/3_results/walkforward_folds.csv, walkforward_summary.csv")
+
+    B = breach_table(acct_rows)
+    post = int(B["post_breach_net"].sum())
+    n_breach = int(B["breached"].sum())
+    adj = int(F["OOS_net"].sum()) - post
+    print("\nPROP-REALITY: account termination at limit")
+    print(f"  breached account-folds        {n_breach} of {len(B)}")
+    print(f"  post-breach net (uncounted by a real account) ${post:,}")
+    print(f"  OOS as scored (no termination) ${int(F['OOS_net'].sum()):,}")
+    print(f"  OOS termination-adjusted       ${adj:,}  (+ eval/reset fees x {n_breach})")
+    B.to_csv("data/3_results/walkforward_breaches.csv", index=False)
+
+    # ---- HTML REPORT --------------------------------------------------------
+    try:
+        import plotly.offline as po
+        ms = [pd.Timestamp(t[0]).value // 10**6 for t in oos_trades]
+        eqs = np.round(eq_ := np.cumsum([t[1] for t in oos_trades]), 1).tolist()
+        dds = np.round(eq_ - np.maximum.accumulate(
+            np.concatenate(([0.0], eq_)))[1:], 1).tolist()
+        payload = {
+            "sum": summary, "folds": F.to_dict("records"),
+            "breach": B.to_dict("records"),
+            "eq": {"x": ms, "y": eqs, "dd": dds},
+            "bounds": [str(f[0].date()) for f in FOLDS],
+            "adj": {"post": post, "n": n_breach, "adjusted": adj},
+            "gen": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+            "prov": {"run": prov.RUN_ID, "git": prov.git_info().get("commit")},
+        }
+        html = (_WF_TPL.replace("__PLOTLYJS__", po.get_plotlyjs())
+                .replace("__DATA__", json.dumps(payload, separators=(",", ":"), default=str)))
+        with open("reports/walkforward.html", "w", encoding="utf-8") as fh:
+            fh.write(html)
+        print("Saved reports/walkforward.html")
+    except ImportError:
+        print("(plotly missing - HTML skipped)")
+
+
+if __name__ == "__main__":
+    main()

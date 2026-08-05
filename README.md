@@ -94,6 +94,11 @@ python 1_select_rr.py --promote recommended
 python 2_analyze_maemfe.py
 python 3_allocate_accounts.py
 python 4_build_report.py
+
+# 5-6. validation: does any of it survive on data it never saw?
+python 5_walkforward.py                       # anchored folds, one configuration
+python 6_cap_rr_grid.py                       # cap x RR grid, every cell walk-forward
+python 6_cap_rr_grid.py --deploy 1.5 0.55     # the config to actually forward-test
 ```
 
 ### 0 — `0_run_mt5_sweeps.py`
@@ -150,6 +155,37 @@ blocked entries.
 One self-contained interactive HTML (Plotly inlined, offline). Per-trade data is
 shipped into the page, so **every chart on the Portfolio tab recomputes from the
 windows you tick** — including the drawdown subplot.
+
+### 5 — `5_walkforward.py`
+Anchored walk-forward of the **whole** selection process: fit 2020→N, freeze the
+decision, score the untouched next year, roll. Steps 1 and 3 execute at import,
+so their core logic (same DD walk, ±`SMOOTH_RR` neighbourhood, same ILP) is
+reimplemented here faithfully rather than imported. Risk uses the MFE-first DD
+**upper bound** — the per-pass MT5 calibration covers the full period and cannot
+be used inside an earlier fold without leaking its test period.
+
+Importable: `load_db()`, `select()`, `build_groups()`/`solve_groups()`,
+`score_allocation()`, `breach_table()`. Step 6 drives exactly this code, so the
+two can never drift apart.
+
+- **out:** `data/3_results/walkforward_{folds,summary,breaches}.csv`,
+  `reports/walkforward.html`
+
+### 6 — `6_cap_rr_grid.py`
+`CAP_FRACTION` × fixed-RR grid, every cell scored walk-forward by step 5's code.
+Group evaluation depends on (RR, fold) but **not** on the cap, so groups are
+built once and each cap is only an ILP re-solve — a 210-cell grid costs ~64
+builds, ~11 min. Results and the decision that came out of them: see
+`FORWARD_TESTING_PLAN.md` §12.
+
+```bash
+python 6_cap_rr_grid.py --rr-range 0.5 2.5 --cap-range 0.40 0.85
+python 6_cap_rr_grid.py --report-only        # rebuild the HTML from the CSVs
+python 6_cap_rr_grid.py --deploy 1.5 0.55    # fit chosen cell on ALL data -> live config
+```
+
+- **out:** `data/3_results/wfa_grid_{cells,folds,breaches}.csv`,
+  `data/3_results/forward_test_config.csv`, `reports/cap_rr_grid.html`
 
 ## EA requirements (both RR and GG)
 

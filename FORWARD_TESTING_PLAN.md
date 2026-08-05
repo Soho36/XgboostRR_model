@@ -255,3 +255,128 @@ account-folds breached; post-breach profit $3,834 means as-scored OOS is
 FLATTERED, not dragged down, by blown accounts — termination-adjusted OOS =
 $25,240 (+4 eval/reset fees). So the modest OOS number is performance+risk,
 NOT an artefact of blown accounts sitting out. reports/walkforward.html built.
+
+## 12. CAP × RR GRID (2026-08-05, `6_cap_rr_grid.py`)
+
+210 cells — fixed RR 0.50→2.50 step 0.10 (the requested 1.0–2.5 band, extended
+down so the answer could not sit on a grid edge) × CAP_FRACTION 0.40→0.85 step
+0.05 — every cell walk-forward scored on the same four folds, plus the
+per-window selection arm at each cap as reference. `reports/cap_rr_grid.html`.
+
+The decision rule (survival first, then adjusted OOS, then prefer the middle of
+a plateau) was written into the script docstring **before** the run.
+
+### 12.1 The cap is the whole survival story
+
+Across the entire RR axis, per cap: how many of the 21 RRs kept every account
+alive in every fold, and the breach rate over all account-folds.
+
+| cap | safe RRs | breach rate | adj OOS median | adj OOS best | worst % median | accounts |
+|---|---|---|---|---|---|---|
+| 40% | 21/21 | 0.0% | $4,229 | $7,627 | 72 | 1–6 |
+| 45% | 20/21 | 0.3% | $4,422 | $9,218 | 81 | 1–6 |
+| 50% | 19/21 | 0.5% | $9,314 | $14,998 | 94 | 2–6 |
+| **55%** | **14/21** | **2.0%** | **$11,968** | **$16,390** | **99** | **2–6** |
+| 60% | 7/21 | 5.8% | $13,545 | $21,609 | 108 | 3–6 |
+| 65% | 3/21 | 7.8% | $16,554 | $24,878 | 118 | 3–6 |
+| 70% | 0/21 | 15.0% | $20,577 | $31,484 | 132 | 4–6 |
+| 75% | 0/21 | 16.1% | $19,694 | $31,232 | 132 | 6 |
+| 80% | 0/21 | 19.6% | $20,269 | $34,289 | 138 | 6 |
+| 85% | 0/21 | 20.6% | $24,742 | $34,381 | 157 | 6 |
+
+**At 70% and above there is no RR that survives — not one of 21.** The 85% cap
+that produced every headline number in this project blows about one account-fold
+in five. The transition is monotone and covers the whole RR axis, so it is a
+property of the cap, not a lucky cell: **cap ≤55%, and 50% if you want room to
+be wrong about RR.**
+
+Caveat on the two tightest caps: 40–45% is safe partly by *not trading* —
+allocation thins to 1–3 accounts and OOS collapses to $4k. 50–55% still deploys
+5–6 accounts in the early folds, so its safety is real, not abstention.
+
+### 12.2 RR barely matters for survival, and its profit plateau is wide
+
+Within the surviving band the breach map is essentially flat along RR — no RR
+value rescues a loose cap, and none ruins a tight one. For profit at cap 55%,
+RR 1.5–2.0 is one contiguous breach-free block paying $15.1k–$16.4k adjusted;
+RR ≥2.2 decays; RR ≤0.7 is weak. Summed across caps ≤55%, RR 1.2–1.5 is the
+plateau ($35.7k/$36.2k/$45.1k/$38.1k) with RR 1.4 the peak.
+
+The raw argmax of the pre-registered rule was **cap 65% / RR 2.00** ($21,884, no
+breaches). It is **rejected by clause 4**: only 1 of its 4 neighbours survives,
+its column breaches at the next cap step, and only 3 of 21 RRs survive at 65%.
+Surviving there is luck, and its worst account still reached 94% of its limit.
+
+### 12.3 Chosen operating point: **fixed RR 1.5, cap 55%**
+
+| fold | test | OOS net | accounts | windows | worst acct % of limit |
+|---|---|---|---|---|---|
+| 1 | 2023 | $1,437 | 6 | 12 | 63.0% |
+| 2 | 2024 | $4,291 | 6 | 11 | 69.7% |
+| 3 | 2025 | $4,164 | 6 | 11 | 88.1% |
+| 4 | 2026H1 | $5,256 | 4 | 7 | 47.7% |
+
+$15,148 total, **0 of 22 account-folds breached**, WFE 0.855, 4/4 folds positive.
+Measured against §9's pre-registered bar this is the **first configuration in the
+project to pass every criterion**: WFE ≥0.5 ✓, ≥3/4 folds positive ✓, no account
+over its limit ✓, and the per-window selection arm does not beat it (§12.4) ✓.
+
+Why RR 1.5 rather than 1.7–2.0, which pay $0.3–1.2k more: its worst account
+reached 88% of limit against their 98–100%, it is 4/4 folds positive, and it was
+the value **pre-declared as the control** before any of this was run — so it is
+the single least hindsight-loaded choice available on the plateau. Documented
+alternatives: cap 50% (more conservative, ~$9.5k, 19/21 RRs safe) and cap 60%
+(~$21.6k, still breach-free at RR 1.5, but only 7/21 RRs safe — much less margin
+for being wrong about RR).
+
+### 12.4 Per-window RR selection loses again, at almost every cap
+
+Same rig, same folds, same caps. "Fixed @1.5" is the pre-declared RR, not a
+hindsight pick:
+
+| cap | selection adj $ | breaches | fixed @1.5 adj $ | breaches |
+|---|---|---|---|---|
+| 50% | 9,402 | 1 | 9,484 | 0 |
+| 55% | 14,382 | 1 | **15,148** | **0** |
+| 60% | 12,015 | 4 | 21,609 | 0 |
+| 65% | 15,169 | 3 | 21,725 | 1 |
+| 70% | 21,558 | 1 | 28,784 | 2 |
+| 75% | **33,370** | 1 | 27,751 | 3 |
+| 80% | 24,615 | 4 | 31,178 | 2 |
+| 85% | 25,240 | 4 | 32,457 | 2 |
+
+Fixed RR wins 9 of 10 caps and breaches less at every cap ≤60%. The one
+exception (75%) sits inside a non-monotone cap response — $21.6k → $33.4k →
+$24.6k → $25.2k — which is a noise signature, not an edge. **The per-window RR
+layer is finished: it costs complexity, loses money, and loses accounts.**
+
+### 12.5 The horizon problem this exposed — read before deploying
+
+`--deploy 1.5 0.55` fits the chosen cell on **all** 6.5 years and fills only
+**3 accounts** (RR 5-6 + RR 7-8; RR 3-4 + RR 23-24; GG 4-5), fit net $20,626.
+Fold 1 fitted on 3 years and filled 6. The cause: the cap is applied to the
+**max drawdown over the whole fit period**, and that maximum only grows as
+history accumulates. So the same 55% cap gets strictly stricter every year, and
+the deployed configuration is tested against a 6.5-year DD while every validated
+fold sized against a 3–6 year one and then ran for a single year.
+
+This is conservative, not wrong — but it is not what the walk-forward validated.
+Three ways out, in preference order:
+
+1. **Rolling fixed-length fit** (e.g. last 3 years) so the DD statistic always
+   has the horizon the folds used. `select()` and `build_groups()` already take
+   `fit_a`, so this is a small change and the §4 plan already lists it as the
+   sensitivity check to run.
+2. Size the cap on a DD **percentile** rather than the single worst excursion.
+3. Accept 3 accounts and less deployed capital.
+
+Until that is settled, the 3-account config is the safe thing to forward-test —
+it under-deploys, it does not under-protect.
+
+### 12.6 Standing limitation
+
+Choosing a cell by its out-of-sample score is second-order fitting: 210 cells
+against 4 folds. The mitigations are that the cap conclusion is monotone across
+the entire grid (not a cherry-picked cell), the RR plateau is wide and flat, and
+RR 1.5 was pre-declared. It remains true that the demo forward test is the only
+evidence not conditioned on this history.
